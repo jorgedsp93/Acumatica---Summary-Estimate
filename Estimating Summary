@@ -1,0 +1,826 @@
+/****  Quote Summary → colour‑coded Sheet + PDF email  ****/
+
+const SET = {
+  rawSheet: 'Acumatica Estimate',      // data tab
+  reportSheet: 'Quote_Report',         // report tab
+  scopeSheet: 'Scope of Work',         // tab with scopes and notes
+  testMode: false,                     // flip to false to go live
+  testRecipients: 'jserrano@meadowb.com',
+  prodRecipients: 'estimating@meadowb.com',
+  quoteNumber: '',
+  tz: Session.getScriptTimeZone(),
+  dateFmt: 'yyyy-MM-dd',
+  logSheet: 'Script_Log'
+};
+
+// colours
+const COLORS = {
+  headerTop:   '#D9EAD3',
+  Construction:'#CFE2F3',
+  Electrical:  '#F4CCCC',
+  HVAC:        '#FCE5CD',
+  Plumbing:    '#D9D2E9',
+  Sprinklers:  '#E6E6E6',
+  Subtrade:    '#FAD1E8',
+  Exclusions:  '#FFF2CC'
+};
+
+/* ---------- old width map (unused in new flat tables but kept harmlessly) ---------- */
+const COL_WIDTHS = {
+  1: 520, 2: 110, 3: 110, 4: 90, 5: 110, 6: 110, 7: 110, 8: 110, 9: 110, 10: 110, 11: 110, 12: 90, 13: 90
+};
+
+// number helpers
+const NF2 = new Intl.NumberFormat('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+function n(v){ return NF2.format(Number(v||0)); }
+function pct(v){ return NF2.format(Number(v||0)*100) + '%'; }
+
+/* ---------------- UI ---------------- */
+
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('Quote Summary')
+    .addItem('Create and email PDF', 'openQuoteSummaryDialog')
+    .addToUi();
+}
+
+// Legacy entry point kept safe
+function runQuoteSummary() {
+  openQuoteSummaryDialog();
+}
+
+function openQuoteSummaryDialog() {
+  const html = HtmlService.createHtmlOutput(`
+    <div style="font-family:Arial, sans-serif; padding:16px;">
+      <h2 style="margin:0 0 12px 0; font-size:16px;">Quote Summary details</h2>
+      <form id="f" onsubmit="submitForm(event)">
+        <label>Customer name<br>
+          <input type="text" name="customerName" required style="width:100%; padding:6px; box-sizing:border-box">
+        </label>
+        <br><br>
+        <label>Customer address<br>
+          <textarea name="customerAddress" rows="2" style="width:100%; padding:6px; box-sizing:border-box"></textarea>
+        </label>
+        <br><br>
+        <label>Opportunity number<br>
+          <input type="text" name="opportunityNumber" required style="width:100%; padding:6px; box-sizing:border-box">
+        </label>
+        <br><br>
+        <label>Estimate name<br>
+          <input type="text" name="estimateName" required style="width:100%; padding:6px; box-sizing:border-box">
+        </label>
+        <br><br>
+        <button id="go" type="submit" style="padding:8px 14px;">Create PDF and Email</button>
+        <span id="msg" style="margin-left:8px; color:#555;"></span>
+      </form>
+    </div>
+    <script>
+      function submitForm(e){
+        e.preventDefault();
+        const btn = document.getElementById('go');
+        const msg = document.getElementById('msg');
+        btn.disabled = true;
+        msg.textContent = 'Working...';
+        const fd = new FormData(document.getElementById('f'));
+        const payload = Object.fromEntries(fd.entries());
+        google.script.run
+          .withSuccessHandler(function(){ google.script.host.close(); })
+          .withFailureHandler(function(err){
+            btn.disabled = false;
+            msg.textContent = String(err && err.message ? err.message : err);
+          })
+          .runQuoteSummaryWithInputs(payload);
+      }
+    </script>
+  `).setWidth(420).setHeight(460);
+  SpreadsheetApp.getUi().showModalDialog(html, 'Quote Summary');
+}
+
+
+/* ---------------- main runner with dialog inputs ---------------- */
+
+function runQuoteSummaryWithInputs(formInputs) {
+  const started = new Date();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss) throw new Error('Open the sheet and run from its Quote Summary menu');
+  const sh = ss.getSheetByName(SET.rawSheet);
+  if (!sh) throw new Error(`Sheet "${SET.rawSheet}" not found`);
+
+  const lock = LockService.getDocumentLock();
+  if (!lock.tryLock(60 * 1000)) {
+    log('Another run is already in progress. Exiting.');
+    SpreadsheetApp.getActive().toast('Quote Summary is already running. Try again in a minute.', 'Busy', 5);
+    return;
+  }
+
+  try {
+    log('run started ' + started.toISOString());
+
+    // Validate inputs from dialog
+    const ci = validateInputs_(formInputs);
+
+    // data to rows
+    const data = sh.getDataRange().getValues();
+    const headers = data.shift();
+    const H = headerMap(headers);
+    const rows = data
+      .filter(r => r.join('').trim() !== '')
+      .map(r => normalizeRow(r, H));
+
+    // crunch
+    const result = crunch(rows);
+
+    // header details
+    result.header.customerName      = ci.customerName;
+    result.header.customerAddress   = ci.customerAddress;  // optional
+    result.header.opportunityNumber = ci.opportunityNumber;
+    result.header.estimateName      = ci.estimateName;
+    result.header.version           = getNextVersion_(ci); // keyed by Opportunity #
+
+    // scope and notes
+    const scopeNotes = readScopesNotesExclusions();
+    result.scopes      = scopeNotes.scopes;
+    result.notes       = scopeNotes.notes;
+    result.manualExcl  = scopeNotes.exclusions;
+
+    // build report (flat tables per division)
+    const reportSheet = buildReportSheet(result, rows);
+
+    SpreadsheetApp.flush();
+    Utilities.sleep(500);
+
+    const pdfName = `Quote Summary - ${result.header.createdAt}`;
+    const pdf = exportSingleSheetToPdf(ss.getId(), reportSheet.getSheetId(), pdfName);
+
+    const recips = SET.testMode ? SET.testRecipients : SET.prodRecipients;
+
+    // Subject format: {Customer}, {Address}, {Estimate} - {Opportunity #}
+    const left = [result.header.customerName, result.header.customerAddress, result.header.estimateName]
+      .filter(s => (s || '').trim())
+      .join(', ');
+    const subject = `${left} - ${result.header.opportunityNumber}`;
+
+    const body =
+`Attached is the quote summary.
+Mode: ${SET.testMode ? 'test' : 'live'}
+Quote: ${result.header.quoteNumber || '-'}
+Opportunity: ${result.header.opportunityNumber}
+Estimate: ${result.header.estimateName}
+Customer: ${result.header.customerName}
+Version: v${result.header.version}
+Created: ${result.header.createdAt}`;
+
+    MailApp.sendEmail(recips, subject, body, { attachments: [pdf] });
+    SpreadsheetApp.getActive().toast('Quote Summary sent to ' + recips, 'Done', 5);
+  } catch (e) {
+    log('ERROR ' + e.message + '\n' + (e.stack || 'no stack'));
+    try { MailApp.sendEmail(SET.testRecipients, '[Quote Summary ERROR]', e.message + '\n\n' + e.stack); } catch (_) {}
+    throw e;
+  } finally {
+    try { lock.releaseLock(); } catch (_) {}
+  }
+}
+
+/* ---------------- robust parsers ---------------- */
+
+function parseNumber(v) {
+  if (v === null || v === undefined) return 0;
+  if (typeof v === 'number') return isFinite(v) ? v : 0;
+  let s = v.toString().trim();
+  if (!s) return 0;
+
+  // support commas, optional parentheses for negatives, and stray text
+  const negParen = /^\(.*\)$/.test(s);
+  s = s.replace(/[^\d\.\-,]/g, '');   // keep digits, dot, comma, minus
+  s = s.replace(/,/g, '');            // remove thousands
+  let n = parseFloat(s);
+  if (!isFinite(n)) n = 0;
+  if (negParen) n = -Math.abs(n);
+  return n;
+}
+
+function parsePercent(v) {
+  if (typeof v === 'string' && v.indexOf('%') >= 0) {
+    const n = parseNumber(v.replace('%', ''));
+    return n / 100;
+  }
+  return parseNumber(v);
+}
+
+/* ---------------- report sheet builder (FLAT tables per division) ---------------- */
+
+function buildReportSheet(r, sourceRows) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sh = ss.getSheetByName(SET.reportSheet);
+  if (!sh) sh = ss.insertSheet(SET.reportSheet); else sh.clear();
+
+  const COLS = 9; // Vendor Name, Description, Quantity, UOM, Unit Cost, Total Cost, Unit Selling, Total Selling, Markup %
+  let row = 1;
+
+  // ---- Header (customer + meta) ----
+  const custName = r.header.customerName || '';
+  const custAddr = r.header.customerAddress || '';
+  const vShow = (typeof r.header.version === 'number') ? r.header.version : (r.header.version || 0);
+  const metaLine1 = `Quote: ${r.header.quoteNumber || '-'}   Version: v${vShow}   Created: ${r.header.createdAt}`;
+  const metaLine2 = `Opportunity: ${r.header.opportunityNumber || '-'}   Estimate: ${r.header.estimateName || '-'}`;
+
+  sh.getRange(row,1,1,COLS).merge()
+    .setValue(custName ? `Customer: ${custName}` : 'Customer:')
+    .setFontWeight('bold').setFontSize(14).setHorizontalAlignment('left'); row++;
+
+  sh.getRange(row,1,1,COLS).merge()
+    .setValue(custAddr || '')
+    .setWrap(true).setHorizontalAlignment('left'); row++;
+
+  sh.getRange(row,1,1,COLS).merge()
+    .setValue(metaLine1)
+    .setBackground('#F3F3F3').setFontWeight('bold').setHorizontalAlignment('left'); row++;
+
+  sh.getRange(row,1,1,COLS).merge()
+    .setValue(metaLine2)
+    .setBackground('#F3F3F3').setHorizontalAlignment('left'); row += 2;
+
+  // ---- Global summary (from crunch) ----
+  sh.getRange(row,1,1,COLS).merge()
+    .setValue(`Total Sell: $${n(r.global.price)}   |   Total Cost: $${n(r.global.cost)}   |   Profit: $${n(r.global.profit)}   |   Margin: ${pct(r.global.margin)}   |   Markup: ${pct(r.global.markup)}`)
+    .setFontWeight('bold').setFontSize(14).setHorizontalAlignment('left').setBackground(COLORS.headerTop);
+  row += 2;
+
+  // ---- Group raw rows by division (preserving original order) ----
+  const lines = (sourceRows || []).filter(l => Number(l.quantity || 0) !== 0);
+  const byDiv = { Construction: [], Electrical: [], HVAC: [], Plumbing: [], Sprinklers: [], Subtrade: [] };
+  lines.forEach(l => {
+    const div = (l.costAccountGroup === 'S') ? 'Subtrade' : divisionFromCostCode(l.costCode);
+    (byDiv[div] || byDiv.Construction).push(l);
+  });
+
+  // ---- Division order + writer ----
+  const divOrder = ['Construction','Electrical','HVAC','Plumbing','Sprinklers','Subtrade'];
+  divOrder.forEach(div => {
+    const divLines = byDiv[div];
+    if (!divLines || divLines.length === 0) return;
+    const scopeText = (r.scopes && r.scopes[div]) ? r.scopes[div] : '—';
+    row = writeFlatDivisionBlock_(sh, row, COLS, div, divLines, scopeText);
+    row += 2;
+  });
+
+  // ---- Notes & Exclusions ----
+  const autoRows  = dedupeAutoExclusions_(r.exclusions);
+  const autoLines = formatAutoExclusionsWithDiv_(autoRows);
+  row = writeNotesExclusionsAuto_(sh, row + 1, COLS, r.notes, r.manualExcl, autoLines);
+
+  sh.autoResizeRows(1, sh.getLastRow());
+  return sh;
+}
+
+// Flat, Acumatica-style table for a single division
+// Flat, Acumatica style table for a single division
+function writeFlatDivisionBlock_(sh, startRow, COLS, divName, divLines, scopeText) {
+  let row = startRow;
+  const showVendor = divName === 'Subtrade';  // only show vendor names in Subtrade
+
+  // Division title
+  sh.getRange(row,1,1,COLS).merge()
+    .setValue(divName)
+    .setFontWeight('bold')
+    .setFontSize(12)
+    .setBackground(COLORS[divName] || '#EAEAEA'); 
+  row++;
+
+  // Subtotal numbers for the division
+  let tCost = 0, tSell = 0;
+  divLines.forEach(l => {
+    const qty = Number(l.quantity || 0);
+    const uCost = Number(l.unitCost || 0);
+    const uPrice = Number(l.unitPrice || 0);
+    const eCost  = (l.extCost !== null && l.extCost !== '' && l.extCost !== 0) ? Number(l.extCost)  : qty * uCost;
+    const ePrice = (l.extPrice !== null && l.extPrice !== '' && l.extPrice !== 0) ? Number(l.extPrice) : qty * uPrice;
+    tCost += eCost; tSell += ePrice;
+  });
+  const profit = tSell - tCost;
+  const margin = (tSell ? profit / tSell : 0);
+  const markup = (tCost ? profit / tCost : 0);
+
+  sh.getRange(row,1,1,COLS).merge()
+    .setValue(`Cost: $${n(tCost)} | Sell: $${n(tSell)} | Profit: $${n(profit)} | Margin: ${pct(margin)} | Markup: ${pct(markup)}`)
+    .setBackground(COLORS[divName] || '#EAEAEA')
+    .setFontStyle('italic');
+  row++;
+
+  // Scope of work line
+  sh.getRange(row,1,1,COLS).merge()
+    .setValue(`Scope of Work: ${scopeText}`)
+    .setWrap(true);
+  row++;
+
+  // Table header
+  const headers = ['Vendor Name','Description','Quantity','UOM','Unit Cost','Total Cost','Unit Selling','Total Selling','Markup %'];
+  if (!showVendor) headers[0] = '';   // hide the vendor header text outside Subtrade
+  const headerRow = row;
+  sh.getRange(row,1,1,COLS).setValues([headers]).setFontWeight('bold').setBackground('#F8F8F8');
+  row++;
+
+  // Data rows
+  const iVendor=1,iDesc=2,iQty=3,iUom=4,iUCost=5,iTCost=6,iUSell=7,iTSell=8,iMarkup=9;
+
+  divLines.forEach(l => {
+    const qty = Number(l.quantity || 0);
+    const uCost = Number(l.unitCost || 0);
+    const uPrice = Number(l.unitPrice || 0);
+    const eCost  = (l.extCost !== null && l.extCost !== '' && l.extCost !== 0) ? Number(l.extCost)  : qty * uCost;
+    const ePrice = (l.extPrice !== null && l.extPrice !== '' && l.extPrice !== 0) ? Number(l.extPrice) : qty * uPrice;
+
+    const arr = [
+      showVendor ? (l.vendor || '') : '',              // only populate for Subtrade
+      l.description || l.projectTask || '',
+      qty,
+      l.uom || '',
+      uCost,
+      eCost,
+      uPrice,
+      ePrice,
+      '' // formula set next
+    ];
+    sh.getRange(row,1,1,COLS).setValues([arr]);
+
+    // Markup % = (Total Selling - Total Cost) / Total Cost
+    const cell = (r,c) => sh.getRange(r,c).getA1Notation();
+    sh.getRange(row, iMarkup).setFormula(`=IF(${cell(row,iTCost)}=0,0,(${cell(row,iTSell)}-${cell(row,iTCost)})/${cell(row,iTCost)})`);
+    row++;
+  });
+
+  const lastDataRow = row - 1;
+  const hasData = lastDataRow >= headerRow + 1;
+
+  // Column widths
+  const widths = [320,420,80,80,100,100,100,100,90];
+  widths.forEach((w, idx) => sh.setColumnWidth(idx + 1, w));
+
+  if (hasData) {
+    // Wrap description
+    sh.getRange(headerRow + 1, iDesc, lastDataRow - headerRow, 1).setWrap(true);
+
+    // Alignments
+    sh.getRange(headerRow + 1, iVendor, lastDataRow - headerRow, 2).setHorizontalAlignment('left');
+    sh.getRange(headerRow + 1, iQty,    lastDataRow - headerRow, COLS - 2).setHorizontalAlignment('right');
+
+    // Number formats
+    sh.getRange(headerRow + 1, iQty,   lastDataRow - headerRow, 1).setNumberFormat('#,##0.00');
+    sh.getRange(headerRow + 1, iUCost, lastDataRow - headerRow, 1).setNumberFormat('"$"#,##0.00');
+    sh.getRange(headerRow + 1, iTCost, lastDataRow - headerRow, 1).setNumberFormat('"$"#,##0.00');
+    sh.getRange(headerRow + 1, iUSell, lastDataRow - headerRow, 1).setNumberFormat('"$"#,##0.00');
+    sh.getRange(headerRow + 1, iTSell, lastDataRow - headerRow, 1).setNumberFormat('"$"#,##0.00');
+    sh.getRange(headerRow + 1, iMarkup,lastDataRow - headerRow, 1).setNumberFormat('0.00%');
+
+    // Alternating row banding for the block
+    sh.getRange(headerRow, 1, lastDataRow - headerRow + 1, COLS)
+      .applyRowBanding(SpreadsheetApp.BandingTheme.LIGHT_GREY, true, false);
+  }
+
+  // Border around the whole division section
+  sh.getRange(startRow,1, lastDataRow - startRow + 1, COLS).setBorder(true,true,true,true,true,true);
+
+  return row;
+}
+
+
+/* --- Notes + Exclusions (manual) + Not included (auto) in one box --- */
+
+function writeNotesExclusionsAuto_(sh, startRow, cols, notesText, manualExclusionsArr, autoExclusionsArr) {
+  let row = startRow;
+
+  // Header
+  sh.getRange(row,1,1,cols).merge()
+    .setValue('Notes and Assumptions')
+    .setFontWeight('bold')
+    .setBackground('#EEE');
+  row++;
+
+  const notesLines  = (notesText ? notesText.split('\n').filter(Boolean) : []);
+  const manualLines = (manualExclusionsArr || []).filter(Boolean);
+  const autoLines   = (autoExclusionsArr   || []).filter(Boolean);
+
+  const parts = [];
+
+  // Notes list
+  if (notesLines.length) parts.push(...notesLines.map(s => '• ' + s));
+
+  // Manual exclusions
+  if (manualLines.length) {
+    if (parts.length) parts.push('', '');
+    parts.push('Exclusions:');
+    parts.push(...manualLines.map(s => '• ' + s));
+  }
+
+  // Auto “Not included in the quote”
+  if (autoLines.length) {
+    if (parts.length) parts.push('', '');
+    parts.push('Not included in the quote:');
+    parts.push(...autoLines.map(s => '• ' + s));
+  }
+
+  const body = parts.length ? parts.join('\n') : '—';
+
+  const bodyRange = sh.getRange(row,1,1,cols).merge();
+  bodyRange
+    .setValue(body)
+    .setWrap(true)
+    .setVerticalAlignment('top')
+    .setHorizontalAlignment('left');
+
+  // Border around section
+  sh.getRange(row-1,1,2,cols).setBorder(true,true,true,true,true,true);
+
+  return row + 2;
+}
+
+/* --- Auto exclusions aggregation --- */
+
+function dedupeAutoExclusions_(lines) {
+  const byKey = {};
+  lines.forEach(x => {
+    const division = (x.costAccountGroup === 'S') ? 'Subtrade' : divisionFromCostCode(x.costCode);
+    const desc = x.description || x.projectTask || '';
+    const typ  = x.costAccountGroup === 'L' ? 'Labour'
+               : x.costAccountGroup === 'MQ' ? 'Material'
+               : x.costAccountGroup === 'S' ? 'Subtrade'
+               : 'Other';
+    const key = `${division}||${desc}`;
+    if (!byKey[key]) byKey[key] = {division, description: desc, types: new Set()};
+    byKey[key].types.add(typ);
+  });
+
+  return Object.values(byKey)
+    .map(e => ({ division: e.division, description: e.description, type: joinTypes(Array.from(e.types)) }))
+    .sort((a,b) => a.division.localeCompare(b.division) || a.description.localeCompare(b.description));
+}
+
+function formatAutoExclusionsWithDiv_(rows) {
+  return rows.map(x => `[${x.division}] ${x.type} for ${x.description}`).filter(Boolean);
+}
+
+function joinTypes(arr){
+  const hasL = arr.includes('Labour');
+  const hasM = arr.includes('Material');
+  const hasS = arr.includes('Subtrade');
+  if ((hasL && hasM) || (hasS && (hasL || hasM))) return 'Mixed';
+  if (hasS) return 'Subtrade';
+  if (hasL && hasM) return 'Labour & Material';
+  if (hasL) return 'Labour';
+  if (hasM) return 'Material';
+  return 'Other';
+}
+
+/* ---------------- scope, notes, exclusions (from Scope of Work tab) ---------------- */
+
+function readScopesNotesExclusions() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName(SET.scopeSheet);
+  const out = { scopes: {}, notes: '', exclusions: [] };
+  if (!sh) return out;
+
+  const lastRow = sh.getLastRow();
+  const lastCol = sh.getLastColumn();
+  if (lastRow < 2 || lastCol < 1) return out;
+
+  // headers row 1
+  const headers = sh.getRange(1,1,1,lastCol).getValues()[0]
+    .map(v => (v||'').toString().trim().toLowerCase());
+
+  function readColumnTextByHeader(headerNeedle) {
+    const idx = headers.findIndex(h => h.includes(headerNeedle.toLowerCase()));
+    if (idx < 0) return '';
+    const col = idx + 1;
+    const values = sh.getRange(2, col, lastRow - 1, 1).getValues()
+      .map(r => (r[0] || '').toString().trim())
+      .filter(Boolean);
+    return values.join('\n');
+  }
+
+  function readColumnArrayByHeader(headerNeedle) {
+    const idx = headers.findIndex(h => h.includes(headerNeedle.toLowerCase()));
+    if (idx < 0) return [];
+    const col = idx + 1;
+    return sh.getRange(2, col, lastRow - 1, 1).getValues()
+      .map(r => (r[0] || '').toString().trim())
+      .filter(Boolean);
+  }
+
+  out.scopes['Construction'] = readColumnTextByHeader('construction scope of work');
+  out.scopes['Electrical']   = readColumnTextByHeader('electrical scope of work');
+  out.scopes['HVAC']         = readColumnTextByHeader('hvac scope of work');
+  out.scopes['Plumbing']     = readColumnTextByHeader('plumbing scope of work');
+  out.scopes['Subtrade']     = readColumnTextByHeader('subtrade');
+
+  out.notes       = readColumnTextByHeader('notes');
+  out.exclusions  = readColumnArrayByHeader('exclusions');
+
+  return out;
+}
+
+/* ---------------- crunching logic ---------------- */
+
+function crunch(rows) {
+  const tasks = {};
+  const divisions = {};
+  const exclusions = [];
+  const quality = [];
+
+  rows.forEach(line => {
+    const qty = Number(line.quantity || 0);
+
+    // authoritative quantity rule
+    if (qty === 0) {
+      exclusions.push(line);
+      logExclude(line, 'quantity equals zero');
+      return;
+    }
+
+    const extCost  = nonZero(line.extCost)  ? line.extCost  : qty * (line.unitCost  || 0);
+    const extPrice = nonZero(line.extPrice) ? line.extPrice : qty * (line.unitPrice || 0);
+    const discount = line.discountAmount || 0;
+
+    const lineHasValue = (qty > 0) || (extCost > 0) || (extPrice > 0);
+    const lineDiv = (line.costAccountGroup === 'S') ? 'Subtrade' : divisionFromCostCode(line.costCode);
+
+    if (extPrice < extCost) quality.push({ reason: 'price lower than cost', line });
+    if (!line.costCode && line.costAccountGroup !== 'S') quality.push({ reason: 'missing cost code', line });
+
+    const taskKey = line.projectTask || '(no task)';
+    if (!tasks[taskKey]) tasks[taskKey] = makeEmptyTask(taskKey, lineDiv, line.description);
+    const t = tasks[taskKey];
+
+    // prefer division and description from lines with value
+    if (lineHasValue && lineDiv && t.division !== lineDiv &&
+       (t.division === 'Construction' || t.division === '(no div)' || t.division === '')) {
+      t.division = lineDiv;
+    }
+    if (lineHasValue && line.description) t.description = line.description;
+
+    // bucket by type
+    const bucket = line.costAccountGroup === 'L'
+      ? t.labour
+      : line.costAccountGroup === 'MQ'
+        ? t.material
+        : t.other;
+
+    bucket.qty      += qty;
+    bucket.cost     += extCost || 0;
+    bucket.price    += extPrice || 0;
+    bucket.discount += discount || 0;
+
+    // division totals
+    divisions[lineDiv] = divisions[lineDiv] || makeEmptyDiv(lineDiv);
+    const d = divisions[lineDiv];
+    d.cost          += extCost || 0;
+    d.price         += extPrice || 0;
+    d.discount      += discount || 0;
+    d.labourCost    += line.costAccountGroup === 'L'  ? extCost  : 0;
+    d.materialCost  += line.costAccountGroup === 'MQ' ? extCost  : 0;
+    d.labourPrice   += line.costAccountGroup === 'L'  ? extPrice : 0;
+    d.materialPrice += line.costAccountGroup === 'MQ' ? extPrice : 0;
+
+    if (line.costAccountGroup === 'L') {
+      const lUC = qty ? (extCost / qty) : 0;
+      const lUS = qty ? (extPrice / qty) : 0;
+      if (lUC) pushUnique(d.labourCostRates, round2(lUC));
+      if (lUS) pushUnique(d.labourSellRates, round2(lUS));
+    }
+  });
+
+  // finalize tasks
+  Object.values(tasks).forEach(t => {
+    t.cost     = t.labour.cost + t.material.cost + t.other.cost;
+    t.price    = t.labour.price + t.material.price + t.other.price;
+    t.discount = t.labour.discount + t.material.discount + t.other.discount;
+    computePMM(t);
+    computePMM(t.labour);
+    computePMM(t.material);
+  });
+
+  // finalize divisions
+  Object.values(divisions).forEach(d => computePMM(d));
+
+  // global totals
+  const global = Object.values(divisions).reduce((acc, d) => {
+    acc.cost     += d.cost;
+    acc.price    += d.price;
+    acc.discount += d.discount;
+    return acc;
+  }, { cost: 0, price: 0, discount: 0 });
+  computePMM(global);
+
+  const header = { quoteNumber: SET.quoteNumber, createdAt: formatDate(new Date()) };
+  return { header, tasks, divisions, exclusions, quality, global };
+}
+
+/* ---------------- labour rate helpers (still used for division summaries) ---------------- */
+
+function summarizeDivisionLabourRate(d) {
+  const cost = pickMode(d.labourCostRates);
+  const sell = pickMode(d.labourSellRates);
+  const label = `$${n(cost.mode)} / $${n(sell.mode)}`;
+  return { label, cost, sell };
+}
+
+function buildLabourRateDetails(modeCost, modeSell, divTasks) {
+  const costMap = {};
+  const sellMap = {};
+
+  divTasks.forEach(t => {
+    const hrs = Number(t.labour.qty || 0);
+    if (!hrs) return;
+
+    const c = round2(t.labour.cost / hrs);
+    const s = round2(t.labour.price / hrs);
+
+    if (c && Math.abs(c - modeCost) > 0.009) {
+      if (!costMap[c]) costMap[c] = [];
+      costMap[c].push({ desc: t.description || t.task || '', hrs });
+    }
+    if (s && Math.abs(s - modeSell) > 0.009) {
+      if (!sellMap[s]) sellMap[s] = [];
+      sellMap[s].push({ desc: t.description || t.task || '', hrs });
+    }
+  });
+
+  const lines = [];
+  const fmtList = arr => arr.map(x => `${x.desc} ${n(x.hrs)} hrs`).join(', ');
+
+  const costRates = Object.keys(costMap).map(Number).sort((a,b)=>a-b);
+  const sellRates = Object.keys(sellMap).map(Number).sort((a,b)=>a-b);
+
+  if (costRates.length || sellRates.length) {
+    lines.push('Labour rate details:');
+    costRates.forEach(r => lines.push(`Cost ${n(r)} on ${fmtList(costMap[r])}.`));
+    sellRates.forEach(r => lines.push(`Sell ${n(r)} on ${fmtList(sellMap[r])}.`));
+  }
+
+  return lines.join('\n');
+}
+
+/* ---------------- helpers ---------------- */
+
+function exportSingleSheetToPdf(ssId, sheetId, pdfName) {
+  const url = `https://docs.google.com/spreadsheets/d/${ssId}/export?` +
+    `format=pdf&portrait=false&size=letter&scale=2&sheetnames=false&printtitle=false` +
+    `&pagenumbers=false&gridlines=false&fzr=false&gid=${sheetId}`;
+  const token = ScriptApp.getOAuthToken();
+  const resp = UrlFetchApp.fetch(url, { headers: { Authorization: 'Bearer ' + token } });
+  return resp.getBlob().setName(pdfName + '.pdf');
+}
+
+function log(msg) {
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    if (!ss) { Logger.log(msg); return; }
+    let sh = ss.getSheetByName(SET.logSheet);
+    if (!sh) sh = ss.insertSheet(SET.logSheet);
+    sh.appendRow([new Date(), msg]);
+  } catch (err) { Logger.log(msg); }
+}
+
+function logExclude(line, reason) {
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    let sh = ss.getSheetByName(SET.logSheet);
+    if (!sh) sh = ss.insertSheet(SET.logSheet);
+    sh.appendRow([
+      new Date(),
+      'excluded',
+      reason,
+      line.projectTask || '',
+      line.description || '',
+      line.costAccountGroup || '',
+      line.costCode || '',
+      line.quantity || 0,
+      line.unitCost || 0,
+      line.unitPrice || 0,
+      line.extCost || 0,
+      line.extPrice || 0
+    ]);
+  } catch (err) {
+    Logger.log('exclude ' + reason + ' ' + (line.description || ''));
+  }
+}
+
+function norm(s){ return s ? s.toString().toLowerCase().replace(/\s+/g,' ').trim() : ''; }
+function headerMap(headers){ const map={}; headers.forEach((h,i)=>{ const k=norm(h); if(k) map[k]=i; }); return map; }
+function idx(H, ...names){ for(const n of names){ const k=norm(n); if(k in H) return H[k]; } return -1; }
+
+function normalizeRow(r, H) {
+  const get = (...names) => { const i = idx(H, ...names); return i === -1 ? '' : r[i]; };
+  const num = v => parseNumber(v);
+  const pct = v => parsePercent(v);
+  const str = v => (v || '').toString().trim();
+
+  return {
+    estimator: str(get('estimator')),
+    taxCategory: str(get('tax category')),
+    vendor: str(get('vendor name')),
+    projectTask: str(get('project task')),
+    costAccountGroup: str(get('cost account group','cost account')),
+    costCode: str(get('cost code')),
+    description: str(get('description')),
+    quantity: num(get('quantity')),
+    uom: str(get('uom')),
+    unitCost: num(get('unit cost')),
+    unitPrice: num(get('unit price')),
+    extCost: num(get('ext. cost','ext cost')),
+    extPrice: num(get('ext. price','ext price')),
+    discountPct: pct(get('discount (%)','discount %')),
+    discountAmount: num(get('discount amount','discount am','discount amt')),
+    amount: num(get('amount')),
+    revenueAccountGroup: str(get('revenue account group','revenue acc')),
+    inventoryId: str(get('inventory id'))
+  };
+}
+
+function makeEmptyTask(task, division, description) {
+  return {
+    task,
+    description,
+    division: division || 'Construction',
+    labour:   { qty:0, unitCost:0, unitPrice:0, cost:0, price:0, discount:0, profit:0, margin:0, markup:0 },
+    material: { qty:0, unitCost:0, unitPrice:0, cost:0, price:0, discount:0, profit:0, margin:0, markup:0 },
+    other:    { qty:0, unitCost:0, unitPrice:0, cost:0, price:0, discount:0, profit:0, margin:0, markup:0 },
+    cost:0, price:0, discount:0, profit:0, margin:0, markup:0
+  };
+}
+
+function makeEmptyDiv(name) {
+  return {
+    name,
+    cost:0, price:0, discount:0, profit:0, margin:0, markup:0,
+    labourCost:0, materialCost:0, labourPrice:0, materialPrice:0,
+    labourCostRates:[], labourSellRates:[]
+  };
+}
+
+function divisionFromCostCode(code) {
+  if (!code) return 'Construction';
+  const m = code.toString().match(/^(\d{2})/);
+  const two = m ? m[1] : '';
+  switch (two) {
+    case '26': return 'Electrical';
+    case '23': return 'HVAC';
+    case '22': return 'Plumbing';
+    case '21': return 'Sprinklers';
+    default:   return 'Construction';
+  }
+}
+
+function pickMode(arr) {
+  if (!arr || !arr.length) return {mode: 0, multiple: false, all: []};
+  const freq = {};
+  arr.forEach(v => { freq[v] = (freq[v] || 0) + 1; });
+  let mode = Number(arr[0]), max = 0;
+  Object.keys(freq).forEach(k => { if (freq[k] > max) { max = freq[k]; mode = Number(k); } });
+  const unique = Object.keys(freq).map(Number).sort((a,b)=>a-b);
+  return {mode, multiple: unique.length > 1, all: unique};
+}
+
+function safeDiv(a,b){ return b ? a/b : 0; }
+function nonZero(v){ return v !== null && v !== '' && v !== 0; }
+function computePMM(obj){ obj.profit=(obj.price||0)-(obj.cost||0)-(obj.discount||0); obj.margin=safeDiv(obj.profit,(obj.price||0)); obj.markup=safeDiv(obj.profit,(obj.cost||0)); }
+function pushUnique(arr, val) { if (val !== undefined && val !== null && !arr.includes(val)) arr.push(val); }
+function round2(v){ return Math.round((Number(v) || 0) * 100) / 100; }
+function formatDate(d){ return Utilities.formatDate(d, SET.tz, SET.dateFmt); }
+
+/* ===== Version helpers (keyed by Opportunity #, start at 0) ===== */
+
+// Persist map: { "<opportunityNumber>": <lastVersionUsed> }
+const VERSION_PROP = 'QUOTE_VERSIONS_BY_OPP';
+
+function getNextVersion_(inputs) {
+  const dp = PropertiesService.getDocumentProperties();
+
+  let map;
+  try { map = JSON.parse(dp.getProperty(VERSION_PROP) || '{}'); }
+  catch (e) { map = {}; }
+
+  const key = (inputs.opportunityNumber || '').toString().trim();
+  if (!key) throw new Error('Opportunity number is required for versioning.');
+
+  const current = Number(map[key]);
+  const next = Number.isFinite(current) ? (current + 1) : 0;
+
+  map[key] = next;
+  dp.setProperty(VERSION_PROP, JSON.stringify(map));
+  return next;
+}
+
+// Validate required fields on server (address optional)
+function validateInputs_(f){
+  const clean = (x) => (x || '').toString().trim();
+  const out = {
+    customerName:      clean(f.customerName),
+    customerAddress:   clean(f.customerAddress), // optional
+    opportunityNumber: clean(f.opportunityNumber),
+    estimateName:      clean(f.estimateName),
+  };
+  if (!out.customerName || !out.opportunityNumber || !out.estimateName) {
+    throw new Error('Customer name, Opportunity number, and Estimate name are required.');
+  }
+  return out;
+}
