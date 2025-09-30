@@ -245,6 +245,7 @@ function onOpen(){
     .addItem('Setup once', 'Setup_Once')
     .addSeparator()
     .addItem('Build summary', 'Build_Summary')
+    .addItem('Push Pricing staging to Construction', 'PricingBook_PushToConstruction')
     .addSubMenu(
       ui.createMenu('Download')
         .addItem('Project Tasks CSV', 'Download_Project_Tasks_CSV')
@@ -624,25 +625,29 @@ function buildPricingBookSheet(){
   sh.getRange('O18').setNumberFormat('$#,##0.00');
 
   sh.getRange('B24').setValue('Labour inputs').setFontWeight('bold');
-  sh.getRange('B25:B30').setValues([
+  sh.getRange('B25:B33').setValues([
     ['Area (SF)'],
     ['Hours per 1000 SF'],
-    ['Drop height adjustment'],
+    ['Drop Height Ft'],
+    ['Drop height multiplier'],
     ['Room factor %'],
+    ['Total hours'],
     ['Total hours w/ room'],
-    ['Hour cost $']
+    ['Hour cost $'],
+    ['Labour total $']
   ]);
   sh.getRange('C25').setFormula('=$B$10');
-  sh.getRange('C26').setValue(12);
-  sh.getRange('C27').setFormula('=IF($B$7="",0,ROUND($B$7/40,3))');
-  sh.getRange('C28').setValue(0);
-  sh.getRange('C28').setNumberFormat('0.0%');
-  sh.getRange('C29').setFormula('=IF(C25="",0,ROUND((((C25/1000)*C26)+C27)*(1+C28),3))');
-  sh.getRange('C30').setValue(85).setNumberFormat('$#,##0.00');
-  sh.getRange('C29').setNumberFormat('0.000');
+  sh.getRange('C26').setFormula('=IF(C25="","",IF(C25<500,6,IF(C25<=1000,10,IF(C25<=2500,20,20+20*INT((C25-2500)/2500)))))').setNumberFormat('0.0');
+  sh.getRange('C27').setFormula('=IF($B$7="","",$B$7)').setNumberFormat('0.00');
+  sh.getRange('C28').setFormula('=IF(C27="",1,IF(C27<2,1,IF(AND(C27>=2.1,C27<=4),1.15,IF(AND(C27>4,C27<=6),1.25,IF(AND(C27>6,C27<=10),1.4,1)))))').setNumberFormat('0.00');
+  sh.getRange('C29').setFormula('=IF($B$8="",0,$B$8*0.05)').setNumberFormat('0.0%');
+  sh.getRange('C30').setFormula('=IF(OR(C25="",C28=""),0,ROUND((C25/1000)*C26*C28,3))').setNumberFormat('0.000');
+  sh.getRange('C31').setFormula('=IF(C30=0,0,ROUND(C30*(1+C29),3))').setNumberFormat('0.000');
+  sh.getRange('C32').setValue(85).setNumberFormat('$#,##0.00');
+  sh.getRange('C33').setFormula('=IF(C31=0,0,ROUND(C31*C32,2))').setNumberFormat('$#,##0.00');
 
-  sh.getRange('B33').setValue('Description').setFontWeight('bold');
-  sh.getRange('C33').setFormula('=IF($B$10="","",TEXTJOIN(" ",TRUE,"Supply and install acoustic ceiling system",$E$2,TEXT($B$10,"0.00"),"SF","perimeter",TEXT($B$9,"0.00"),"LF"))');
+  sh.getRange('B35').setValue('Description').setFontWeight('bold');
+  sh.getRange('C35').setFormula('=IF($B$10="","",TEXTJOIN(" ",TRUE,"Supply and install acoustic ceiling system",$E$2,TEXT($B$10,"0.00"),"SF","perimeter",TEXT($B$9,"0.00"),"LF"))');
 
   sh.getRange('B36').setValue('Staging (ready to push)').setFontWeight('bold');
   sh.getRange('B37:B48').setValues([
@@ -659,8 +664,8 @@ function buildPricingBookSheet(){
     ['Area SF'],
     ['Unit Cost per SF']
   ]);
-  sh.getRange('C37').setFormula('=C33');
-  sh.getRange('C38').setFormula('=C29');
+  sh.getRange('C37').setFormula('=C35');
+  sh.getRange('C38').setFormula('=C31');
   sh.getRange('C39').setFormula('=O17');
   sh.getRange('C40').setValue(0);
   sh.getRange('C41').setValue(0.5);
@@ -688,12 +693,12 @@ function buildPricingBookSheet(){
 
 function ensurePricingBookButton_(sh){
   const fn = 'PricingBook_PushToConstruction';
-  const anchorCell = sh.getRange('B4');
+  const anchorCell = sh.getRange('B12');
   const row = anchorCell.getRow();
   const col = anchorCell.getColumn();
 
   const clearFallback = () => {
-    ['B4', 'B12', 'B53'].forEach(ref => {
+    ['B12', 'B53'].forEach(ref => {
       try { sh.getRange(ref).clearContent().clearFormat(); } catch (_) {}
     });
   };
@@ -886,9 +891,9 @@ function ensurePricingBookButton_(sh){
 
   // Final reminder if everything fails
   try {
-    const reminder = sh.getRange('B4');
+    const reminder = sh.getRange('B12');
     if (!String(reminder.getValue()).trim()) {
-      reminder.setValue('Add a button and assign the script "PricingBook_PushToConstruction"')
+      reminder.setValue('Insert a drawing/button near this cell and assign the script "PricingBook_PushToConstruction" (Insert ▶ Drawing ▶ New)')
         .setFontWeight('bold')
         .setBackground('#FFF2CC');
     }
@@ -953,6 +958,20 @@ function PricingBook_PushToConstruction(){
     targetRow = lastRow + 1;
     ensureRows(construction, targetRow);
   }
+
+  // Allow our scripted description even if it is not in the dropdown list
+  try {
+    const descRange = construction.getRange(targetRow, COL.DESC);
+    const currentValidation = descRange.getDataValidation();
+    if (currentValidation) {
+      try {
+        const relaxed = currentValidation.copy().setAllowInvalid(true).build();
+        descRange.setDataValidation(relaxed);
+      } catch (err) {
+        descRange.clearDataValidations();
+      }
+    }
+  } catch (_) {}
 
   // Populate Construction row
   construction.getRange(targetRow, COL.INC).setValue(true);
