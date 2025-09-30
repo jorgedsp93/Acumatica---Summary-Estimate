@@ -1,826 +1,4000 @@
-/****  Quote Summary → colour‑coded Sheet + PDF email  ****/
+/** ===========================================================
+ * MeadowBrook Estimating Book v21
+ * Base: v20/v19
+ * Fixes & adds:
+ * - Item (C) <- Project Task when Description (D) picked
+ * - Rate per Hr (J) & per-line CostRateHr (W) from template
+ * - Cost (H) = Hrs * CostRateHr(W or Settings!B3) + Mat + Subs
+ * - Remove "Selling Final" (O hidden/unused)
+ * - Story panel X..AD; each story line is merged across the row
+ * - Summary header (Version/Built/Grand Total) in E1:F3; sections start at row 5
+ * - Rebuild Summary safely: remove banding & CF first
+ * - Notes/Warranty/Exclusions footer; Exclusions sentence‑cased & trimmed
+ * - Project Tasks CSV dates = today (yyyy-MM-dd)
+ * - Estimation CSV outputs L / MQ / S lines; Cost Code forced as text (=“code”)
+ * - HVAC & Electrical templates seeded from data you provided
+ * =========================================================== */
 
-const SET = {
-  rawSheet: 'Acumatica Estimate',      // data tab
-  reportSheet: 'Quote_Report',         // report tab
-  scopeSheet: 'Scope of Work',         // tab with scopes and notes
-  testMode: false,                     // flip to false to go live
-  testRecipients: 'jserrano@meadowb.com',
-  prodRecipients: 'estimating@meadowb.com',
-  quoteNumber: '',
-  tz: Session.getScriptTimeZone(),
-  dateFmt: 'yyyy-MM-dd',
-  logSheet: 'Script_Log'
+/** Sheet names */
+const S_SUM     = 'Summary';
+const S_PM      = 'Project Mgmt';
+const S_CON     = 'Construction';
+const S_PRICING = 'Pricing Book';
+const S_ELE     = 'Electrical';
+const S_MEC     = 'HVAC';
+const S_PLU     = 'Plumbing';
+const S_CAT     = 'Catalog';
+const S_TPL_P   = 'Template Plumbing';
+const S_TPL_E   = 'Template Electrical';
+const S_TPL_C   = 'Template Construction';
+const S_TPL_H   = 'Template HVAC';
+const S_SET     = 'Settings';
+const S_SCOPE   = 'Scope';
+const S_LOG     = 'Log';
+const S_LIB     = 'Notes Library';
+const S_SRC_TASKS = 'SRC Tasks';
+const S_SRC_REV   = 'SRC Revenue';
+const S_SRC_COST  = 'SRC Cost';
+
+/** Log structure */
+const LOG_HEADERS = ['Timestamp','Action','Area SF','Perimeter LF','Module','Construction Row'];
+
+/** Grid columns
+ * A is hidden include
+ * B..N are user facing (O "Selling Final" no longer used/hidden)
+ * P..W are helpers (hidden)
+ * V is a local hidden mirror of template descriptions (for CF)
+ * W stores per-line Cost Rate $/Hr pulled from template
+ * Story panel lives at X..AD (closer to grid)
+ */
+const COL = {
+  INC: 1,             // A hidden include flag
+  TRADE: 2,           // B
+  PICK: 3,            // C Item (auto-fills with Task when Description chosen)
+  DESC: 4,            // D visible dropdown by Description
+  LBR_HRS: 5,         // E
+  MAT_COST: 6,        // F
+  SUBS_COST: 7,       // G
+  COST: 8,            // H total cost = (hrs * costRateHr) + mat + subs
+  MK: 9,              // I markup %
+  RATE: 10,           // J sell per hour
+  SELL_MAT: 11,       // K
+  SELL_SUB: 12,       // L
+  SELL_HRS: 13,       // M
+  SELL: 14,           // N
+  SELL_UNUSED: 15,    // O (old Selling Final) kept hidden; not used
+  SECTION: 16,        // P hidden helper
+  GROUP: 17,          // Q hidden helper
+  COST_CODE: 18,      // R hidden helper
+  ACCT_GRP: 19,       // S hidden helper
+  UOM: 20,            // T hidden helper
+  TASK: 21,           // U hidden helper stores Task ID
+  VAL_LIST: 22,       // V hidden: local mirror of template descriptions (for CF)
+  COST_RATE_HR: 23    // W hidden: per-line Cost Rate $/Hr from template
 };
 
-// colours
+// Offsets for Summary extraction from B..N
+const IDX_DESC_IN_B2N = COL.DESC - COL.TRADE; // 2
+const IDX_SELL_IN_B2N = COL.SELL - COL.TRADE; // 12
+
+/** Story panel X9..AD40 header X8 */
+const STORY_COL_START   = 'X';
+const STORY_COL_END     = 'AD';
+const STORY_HEADER_ROW  = 8;
+const STORY_ROWS_TOP    = 9;
+const STORY_ROWS_LAST   = 40;
+
+/** Notes block size */
+const NWE_ROWS = 24;
+
+/** Export folder (only used if you keep Drive export helpers) */
+const EXPORT_FOLDER = 'MB Estimator Exports';
+
+/** Colors */
 const COLORS = {
-  headerTop:   '#D9EAD3',
-  Construction:'#CFE2F3',
-  Electrical:  '#F4CCCC',
-  HVAC:        '#FCE5CD',
-  Plumbing:    '#D9D2E9',
-  Sprinklers:  '#E6E6E6',
-  Subtrade:    '#FAD1E8',
-  Exclusions:  '#FFF2CC'
+  PM: '#A9D18E', CON: '#9DC3E6', ELE: '#F4B084', MEC: '#FFD966', PLU: '#B4C7E7',
+  NE: '#E2E2E2', HDR: '#D9E1F2', SUB: '#E6E6E6'
 };
 
-/* ---------- old width map (unused in new flat tables but kept harmlessly) ---------- */
-const COL_WIDTHS = {
-  1: 520, 2: 110, 3: 110, 4: 90, 5: 110, 6: 110, 7: 110, 8: 110, 9: 110, 10: 110, 11: 110, 12: 90, 13: 90
-};
+/** Divisions */
+const DIVS = [
+  { key:'CON', name:'Construction',       sheet:S_CON, color:COLORS.CON, lines:32 },
+  { key:'ELE', name:'Electrical',         sheet:S_ELE, color:COLORS.ELE, lines:22 },
+  { key:'MEC', name:'HVAC',               sheet:S_MEC, color:COLORS.MEC, lines:20 },
+  { key:'PLU', name:'Plumbing',           sheet:S_PLU, color:COLORS.PLU, lines:28 },
+  { key:'PM',  name:'Project Management', sheet:S_PM,  color:COLORS.PM,  lines:12 }
+];
 
-// number helpers
-const NF2 = new Intl.NumberFormat('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-function n(v){ return NF2.format(Number(v||0)); }
-function pct(v){ return NF2.format(Number(v||0)*100) + '%'; }
+/** Defaults for Summary if user adds nothing */
+const DEFAULT_NOTES = [
+  'Client to provide free and clear work area.',
+  'All work to be done during regular hours.',
+  'Client to provide washroom access.'
+];
+const DEFAULT_EXCLUSIONS = [
+  'weekends work or holiday work.',
+  'work or items not stated above.',
+  'Fire Alarm Work.',
+  'new gas pressure reducing valves.',
+  'BAS controls connection.',
+  'roofing.',
+  'coring.',
+  'engineering, drawings, and permits.',
+  'furniture moving.',
+  'asbestos testing, remediation or removal.',
+  'contaminated soil testing, handling or removal.'
+];
 
-/* ---------------- UI ---------------- */
+/** Utilities */
+function colIndex(a){ a=String(a).toUpperCase().trim(); let n=0; for (let i=0;i<a.length;i++) n = n*26 + (a.charCodeAt(i)-64); return n; }
+function colLetter(n){ let s=''; while(n>0){ let m=(n-1)%26; s=String.fromCharCode(65+m)+s; n=(n-1)/26|0; } return s; }
+function wipeOrCreate(ss, name){ let sh = ss.getSheetByName(name); if (!sh) sh = ss.insertSheet(name); sh.clear({contentsOnly:true}); return sh; }
+function ensureLogSheet_(){
+  const ss = SpreadsheetApp.getActive();
+  let sh = ss.getSheetByName(S_LOG);
+  if (!sh) sh = ss.insertSheet(S_LOG);
 
-function onOpen() {
-  SpreadsheetApp.getUi()
-    .createMenu('Quote Summary')
-    .addItem('Create and email PDF', 'openQuoteSummaryDialog')
-    .addToUi();
-}
-
-// Legacy entry point kept safe
-function runQuoteSummary() {
-  openQuoteSummaryDialog();
-}
-
-function openQuoteSummaryDialog() {
-  const html = HtmlService.createHtmlOutput(`
-    <div style="font-family:Arial, sans-serif; padding:16px;">
-      <h2 style="margin:0 0 12px 0; font-size:16px;">Quote Summary details</h2>
-      <form id="f" onsubmit="submitForm(event)">
-        <label>Customer name<br>
-          <input type="text" name="customerName" required style="width:100%; padding:6px; box-sizing:border-box">
-        </label>
-        <br><br>
-        <label>Customer address<br>
-          <textarea name="customerAddress" rows="2" style="width:100%; padding:6px; box-sizing:border-box"></textarea>
-        </label>
-        <br><br>
-        <label>Opportunity number<br>
-          <input type="text" name="opportunityNumber" required style="width:100%; padding:6px; box-sizing:border-box">
-        </label>
-        <br><br>
-        <label>Estimate name<br>
-          <input type="text" name="estimateName" required style="width:100%; padding:6px; box-sizing:border-box">
-        </label>
-        <br><br>
-        <button id="go" type="submit" style="padding:8px 14px;">Create PDF and Email</button>
-        <span id="msg" style="margin-left:8px; color:#555;"></span>
-      </form>
-    </div>
-    <script>
-      function submitForm(e){
-        e.preventDefault();
-        const btn = document.getElementById('go');
-        const msg = document.getElementById('msg');
-        btn.disabled = true;
-        msg.textContent = 'Working...';
-        const fd = new FormData(document.getElementById('f'));
-        const payload = Object.fromEntries(fd.entries());
-        google.script.run
-          .withSuccessHandler(function(){ google.script.host.close(); })
-          .withFailureHandler(function(err){
-            btn.disabled = false;
-            msg.textContent = String(err && err.message ? err.message : err);
-          })
-          .runQuoteSummaryWithInputs(payload);
-      }
-    </script>
-  `).setWidth(420).setHeight(460);
-  SpreadsheetApp.getUi().showModalDialog(html, 'Quote Summary');
-}
-
-
-/* ---------------- main runner with dialog inputs ---------------- */
-
-function runQuoteSummaryWithInputs(formInputs) {
-  const started = new Date();
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  if (!ss) throw new Error('Open the sheet and run from its Quote Summary menu');
-  const sh = ss.getSheetByName(SET.rawSheet);
-  if (!sh) throw new Error(`Sheet "${SET.rawSheet}" not found`);
-
-  const lock = LockService.getDocumentLock();
-  if (!lock.tryLock(60 * 1000)) {
-    log('Another run is already in progress. Exiting.');
-    SpreadsheetApp.getActive().toast('Quote Summary is already running. Try again in a minute.', 'Busy', 5);
-    return;
+  const width = LOG_HEADERS.length;
+  const headerRange = sh.getRange(1, 1, 1, width);
+  const have = headerRange.getValues()[0];
+  const needsHeader = have.length < width || LOG_HEADERS.some((h, i) => String(have[i] || '').trim() !== h);
+  if (needsHeader) {
+    headerRange.setValues([LOG_HEADERS]);
   }
-
-  try {
-    log('run started ' + started.toISOString());
-
-    // Validate inputs from dialog
-    const ci = validateInputs_(formInputs);
-
-    // data to rows
-    const data = sh.getDataRange().getValues();
-    const headers = data.shift();
-    const H = headerMap(headers);
-    const rows = data
-      .filter(r => r.join('').trim() !== '')
-      .map(r => normalizeRow(r, H));
-
-    // crunch
-    const result = crunch(rows);
-
-    // header details
-    result.header.customerName      = ci.customerName;
-    result.header.customerAddress   = ci.customerAddress;  // optional
-    result.header.opportunityNumber = ci.opportunityNumber;
-    result.header.estimateName      = ci.estimateName;
-    result.header.version           = getNextVersion_(ci); // keyed by Opportunity #
-
-    // scope and notes
-    const scopeNotes = readScopesNotesExclusions();
-    result.scopes      = scopeNotes.scopes;
-    result.notes       = scopeNotes.notes;
-    result.manualExcl  = scopeNotes.exclusions;
-
-    // build report (flat tables per division)
-    const reportSheet = buildReportSheet(result, rows);
-
-    SpreadsheetApp.flush();
-    Utilities.sleep(500);
-
-    const pdfName = `Quote Summary - ${result.header.createdAt}`;
-    const pdf = exportSingleSheetToPdf(ss.getId(), reportSheet.getSheetId(), pdfName);
-
-    const recips = SET.testMode ? SET.testRecipients : SET.prodRecipients;
-
-    // Subject format: {Customer}, {Address}, {Estimate} - {Opportunity #}
-    const left = [result.header.customerName, result.header.customerAddress, result.header.estimateName]
-      .filter(s => (s || '').trim())
-      .join(', ');
-    const subject = `${left} - ${result.header.opportunityNumber}`;
-
-    const body =
-`Attached is the quote summary.
-Mode: ${SET.testMode ? 'test' : 'live'}
-Quote: ${result.header.quoteNumber || '-'}
-Opportunity: ${result.header.opportunityNumber}
-Estimate: ${result.header.estimateName}
-Customer: ${result.header.customerName}
-Version: v${result.header.version}
-Created: ${result.header.createdAt}`;
-
-    MailApp.sendEmail(recips, subject, body, { attachments: [pdf] });
-    SpreadsheetApp.getActive().toast('Quote Summary sent to ' + recips, 'Done', 5);
-  } catch (e) {
-    log('ERROR ' + e.message + '\n' + (e.stack || 'no stack'));
-    try { MailApp.sendEmail(SET.testRecipients, '[Quote Summary ERROR]', e.message + '\n\n' + e.stack); } catch (_) {}
-    throw e;
-  } finally {
-    try { lock.releaseLock(); } catch (_) {}
-  }
-}
-
-/* ---------------- robust parsers ---------------- */
-
-function parseNumber(v) {
-  if (v === null || v === undefined) return 0;
-  if (typeof v === 'number') return isFinite(v) ? v : 0;
-  let s = v.toString().trim();
-  if (!s) return 0;
-
-  // support commas, optional parentheses for negatives, and stray text
-  const negParen = /^\(.*\)$/.test(s);
-  s = s.replace(/[^\d\.\-,]/g, '');   // keep digits, dot, comma, minus
-  s = s.replace(/,/g, '');            // remove thousands
-  let n = parseFloat(s);
-  if (!isFinite(n)) n = 0;
-  if (negParen) n = -Math.abs(n);
-  return n;
-}
-
-function parsePercent(v) {
-  if (typeof v === 'string' && v.indexOf('%') >= 0) {
-    const n = parseNumber(v.replace('%', ''));
-    return n / 100;
-  }
-  return parseNumber(v);
-}
-
-/* ---------------- report sheet builder (FLAT tables per division) ---------------- */
-
-function buildReportSheet(r, sourceRows) {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  let sh = ss.getSheetByName(SET.reportSheet);
-  if (!sh) sh = ss.insertSheet(SET.reportSheet); else sh.clear();
-
-  const COLS = 9; // Vendor Name, Description, Quantity, UOM, Unit Cost, Total Cost, Unit Selling, Total Selling, Markup %
-  let row = 1;
-
-  // ---- Header (customer + meta) ----
-  const custName = r.header.customerName || '';
-  const custAddr = r.header.customerAddress || '';
-  const vShow = (typeof r.header.version === 'number') ? r.header.version : (r.header.version || 0);
-  const metaLine1 = `Quote: ${r.header.quoteNumber || '-'}   Version: v${vShow}   Created: ${r.header.createdAt}`;
-  const metaLine2 = `Opportunity: ${r.header.opportunityNumber || '-'}   Estimate: ${r.header.estimateName || '-'}`;
-
-  sh.getRange(row,1,1,COLS).merge()
-    .setValue(custName ? `Customer: ${custName}` : 'Customer:')
-    .setFontWeight('bold').setFontSize(14).setHorizontalAlignment('left'); row++;
-
-  sh.getRange(row,1,1,COLS).merge()
-    .setValue(custAddr || '')
-    .setWrap(true).setHorizontalAlignment('left'); row++;
-
-  sh.getRange(row,1,1,COLS).merge()
-    .setValue(metaLine1)
-    .setBackground('#F3F3F3').setFontWeight('bold').setHorizontalAlignment('left'); row++;
-
-  sh.getRange(row,1,1,COLS).merge()
-    .setValue(metaLine2)
-    .setBackground('#F3F3F3').setHorizontalAlignment('left'); row += 2;
-
-  // ---- Global summary (from crunch) ----
-  sh.getRange(row,1,1,COLS).merge()
-    .setValue(`Total Sell: $${n(r.global.price)}   |   Total Cost: $${n(r.global.cost)}   |   Profit: $${n(r.global.profit)}   |   Margin: ${pct(r.global.margin)}   |   Markup: ${pct(r.global.markup)}`)
-    .setFontWeight('bold').setFontSize(14).setHorizontalAlignment('left').setBackground(COLORS.headerTop);
-  row += 2;
-
-  // ---- Group raw rows by division (preserving original order) ----
-  const lines = (sourceRows || []).filter(l => Number(l.quantity || 0) !== 0);
-  const byDiv = { Construction: [], Electrical: [], HVAC: [], Plumbing: [], Sprinklers: [], Subtrade: [] };
-  lines.forEach(l => {
-    const div = (l.costAccountGroup === 'S') ? 'Subtrade' : divisionFromCostCode(l.costCode);
-    (byDiv[div] || byDiv.Construction).push(l);
-  });
-
-  // ---- Division order + writer ----
-  const divOrder = ['Construction','Electrical','HVAC','Plumbing','Sprinklers','Subtrade'];
-  divOrder.forEach(div => {
-    const divLines = byDiv[div];
-    if (!divLines || divLines.length === 0) return;
-    const scopeText = (r.scopes && r.scopes[div]) ? r.scopes[div] : '—';
-    row = writeFlatDivisionBlock_(sh, row, COLS, div, divLines, scopeText);
-    row += 2;
-  });
-
-  // ---- Notes & Exclusions ----
-  const autoRows  = dedupeAutoExclusions_(r.exclusions);
-  const autoLines = formatAutoExclusionsWithDiv_(autoRows);
-  row = writeNotesExclusionsAuto_(sh, row + 1, COLS, r.notes, r.manualExcl, autoLines);
-
-  sh.autoResizeRows(1, sh.getLastRow());
+  if (sh.getFrozenRows() < 1) sh.setFrozenRows(1);
   return sh;
 }
 
-// Flat, Acumatica-style table for a single division
-// Flat, Acumatica style table for a single division
-function writeFlatDivisionBlock_(sh, startRow, COLS, divName, divLines, scopeText) {
-  let row = startRow;
-  const showVendor = divName === 'Subtrade';  // only show vendor names in Subtrade
+function logMsg(msg){
+  const sh = ensureLogSheet_();
+  sh.appendRow([new Date(), msg, '', '', '', '']);
+}
+function safeSetColWidths(sh, start, count, width){ const max = sh.getMaxColumns(); const n = Math.min(count, Math.max(0, max - start + 1)); if (n>0) sh.setColumnWidths(start,n,width); }
+function ensureRows(sh, minRow){ const maxR = sh.getMaxRows(); if (maxR < minRow) sh.insertRowsAfter(maxR, minRow - maxR); }
+function unmergeAll(sh){ sh.getRange(1,1, sh.getMaxRows(), sh.getMaxColumns()).breakApart(); }
+function mergeSafeSet(range, text){
+  const sh = range.getSheet();
+  try{ range.breakApart(); }catch(e){ unmergeAll(sh); }
+  try{
+    const r = range.merge();
+    if (text !== undefined) r.setValue(text);
+    return r;
+  }catch(e){
+    unmergeAll(sh);
+    const r = range.merge();
+    if (text !== undefined) r.setValue(text);
+    return r;
+  }
+}
+function ensureCols(sh, minCol){
+  const maxC = sh.getMaxColumns();
+  if (maxC < minCol) sh.insertColumnsAfter(maxC, minCol - maxC);
+}
+function hideHelperCols_(sh){
+  // Hide P..W (helpers + validation mirror + cost rate)
+  const maxC = sh.getMaxColumns();
+  const start = COL.SECTION;
+  const end = Math.max(COL.VAL_LIST, COL.COST_RATE_HR);
+  if (start <= maxC){
+    const count = Math.min(end - start + 1, Math.max(0, maxC - start + 1));
+    if (count > 0) sh.hideColumns(start, count);
+  }
+}
 
-  // Division title
-  sh.getRange(row,1,1,COLS).merge()
-    .setValue(divName)
-    .setFontWeight('bold')
-    .setFontSize(12)
-    .setBackground(COLORS[divName] || '#EAEAEA'); 
-  row++;
-
-  // Subtotal numbers for the division
-  let tCost = 0, tSell = 0;
-  divLines.forEach(l => {
-    const qty = Number(l.quantity || 0);
-    const uCost = Number(l.unitCost || 0);
-    const uPrice = Number(l.unitPrice || 0);
-    const eCost  = (l.extCost !== null && l.extCost !== '' && l.extCost !== 0) ? Number(l.extCost)  : qty * uCost;
-    const ePrice = (l.extPrice !== null && l.extPrice !== '' && l.extPrice !== 0) ? Number(l.extPrice) : qty * uPrice;
-    tCost += eCost; tSell += ePrice;
+function hideSheets_(names, hide){
+  const ss = SpreadsheetApp.getActive();
+  names.forEach(n=>{
+    const sh = ss.getSheetByName(n);
+    if (!sh) return;
+    if (hide) {
+      sh.hideSheet();
+    } else {
+      sh.showSheet();
+    }
   });
-  const profit = tSell - tCost;
-  const margin = (tSell ? profit / tSell : 0);
-  const markup = (tCost ? profit / tCost : 0);
+}
 
-  sh.getRange(row,1,1,COLS).merge()
-    .setValue(`Cost: $${n(tCost)} | Sell: $${n(tSell)} | Profit: $${n(profit)} | Margin: ${pct(margin)} | Markup: ${pct(markup)}`)
-    .setBackground(COLORS[divName] || '#EAEAEA')
-    .setFontStyle('italic');
-  row++;
 
-  // Scope of work line
-  sh.getRange(row,1,1,COLS).merge()
-    .setValue(`Scope of Work: ${scopeText}`)
-    .setWrap(true);
-  row++;
+// One-click toggles (so you can show them later if you need to edit)
+function Hide_Admin_Sheets(){
+  hideSheets_(
+    [S_TPL_P, S_TPL_E, S_TPL_C, S_TPL_H, S_SRC_TASKS, S_SRC_REV, S_SRC_COST, S_CAT, S_LOG, S_SCOPE, S_SET],
+    true
+  );
+}
+function Show_Admin_Sheets(){
+  hideSheets_(
+    [S_TPL_P, S_TPL_E, S_TPL_C, S_TPL_H, S_SRC_TASKS, S_SRC_REV, S_SRC_COST, S_CAT, S_LOG, S_SCOPE, S_SET],
+    false
+  );
+}
 
-  // Table header
-  const headers = ['Vendor Name','Description','Quantity','UOM','Unit Cost','Total Cost','Unit Selling','Total Selling','Markup %'];
-  if (!showVendor) headers[0] = '';   // hide the vendor header text outside Subtrade
-  const headerRow = row;
-  sh.getRange(row,1,1,COLS).setValues([headers]).setFontWeight('bold').setBackground('#F8F8F8');
-  row++;
 
-  // Data rows
-  const iVendor=1,iDesc=2,iQty=3,iUom=4,iUCost=5,iTCost=6,iUSell=7,iTSell=8,iMarkup=9;
+/** Story helpers */
+function storyHeaderRange(){ return `${STORY_COL_START}${STORY_HEADER_ROW}:${STORY_COL_END}${STORY_HEADER_ROW}`; }
+function storyLinesRange(){ return `${STORY_COL_START}${STORY_ROWS_TOP}:${STORY_COL_END}${STORY_ROWS_LAST}`; }
 
-  divLines.forEach(l => {
-    const qty = Number(l.quantity || 0);
-    const uCost = Number(l.unitCost || 0);
-    const uPrice = Number(l.unitPrice || 0);
-    const eCost  = (l.extCost !== null && l.extCost !== '' && l.extCost !== 0) ? Number(l.extCost)  : qty * uCost;
-    const ePrice = (l.extPrice !== null && l.extPrice !== '' && l.extPrice !== 0) ? Number(l.extPrice) : qty * uPrice;
-
-    const arr = [
-      showVendor ? (l.vendor || '') : '',              // only populate for Subtrade
-      l.description || l.projectTask || '',
-      qty,
-      l.uom || '',
-      uCost,
-      eCost,
-      uPrice,
-      ePrice,
-      '' // formula set next
-    ];
-    sh.getRange(row,1,1,COLS).setValues([arr]);
-
-    // Markup % = (Total Selling - Total Cost) / Total Cost
-    const cell = (r,c) => sh.getRange(r,c).getA1Notation();
-    sh.getRange(row, iMarkup).setFormula(`=IF(${cell(row,iTCost)}=0,0,(${cell(row,iTSell)}-${cell(row,iTCost)})/${cell(row,iTCost)})`);
-    row++;
-  });
-
-  const lastDataRow = row - 1;
-  const hasData = lastDataRow >= headerRow + 1;
-
-  // Column widths
-  const widths = [320,420,80,80,100,100,100,100,90];
-  widths.forEach((w, idx) => sh.setColumnWidth(idx + 1, w));
-
-  if (hasData) {
-    // Wrap description
-    sh.getRange(headerRow + 1, iDesc, lastDataRow - headerRow, 1).setWrap(true);
-
-    // Alignments
-    sh.getRange(headerRow + 1, iVendor, lastDataRow - headerRow, 2).setHorizontalAlignment('left');
-    sh.getRange(headerRow + 1, iQty,    lastDataRow - headerRow, COLS - 2).setHorizontalAlignment('right');
-
-    // Number formats
-    sh.getRange(headerRow + 1, iQty,   lastDataRow - headerRow, 1).setNumberFormat('#,##0.00');
-    sh.getRange(headerRow + 1, iUCost, lastDataRow - headerRow, 1).setNumberFormat('"$"#,##0.00');
-    sh.getRange(headerRow + 1, iTCost, lastDataRow - headerRow, 1).setNumberFormat('"$"#,##0.00');
-    sh.getRange(headerRow + 1, iUSell, lastDataRow - headerRow, 1).setNumberFormat('"$"#,##0.00');
-    sh.getRange(headerRow + 1, iTSell, lastDataRow - headerRow, 1).setNumberFormat('"$"#,##0.00');
-    sh.getRange(headerRow + 1, iMarkup,lastDataRow - headerRow, 1).setNumberFormat('0.00%');
-
-    // Alternating row banding for the block
-    sh.getRange(headerRow, 1, lastDataRow - headerRow + 1, COLS)
-      .applyRowBanding(SpreadsheetApp.BandingTheme.LIGHT_GREY, true, false);
+/** Template options by division */
+function templateOptions(div){
+  switch (div.key){
+    case 'PLU': return ['No Template','Plumbing'];
+    case 'MEC': return ['No Template','HVAC'];
+    case 'ELE': return ['No Template','Electrical'];
+    case 'CON': return ['No Template','Construction'];
+    default:    return ['No Template'];
   }
-
-  // Border around the whole division section
-  sh.getRange(startRow,1, lastDataRow - startRow + 1, COLS).setBorder(true,true,true,true,true,true);
-
-  return row;
 }
 
 
-/* --- Notes + Exclusions (manual) + Not included (auto) in one box --- */
-
-function writeNotesExclusionsAuto_(sh, startRow, cols, notesText, manualExclusionsArr, autoExclusionsArr) {
-  let row = startRow;
-
-  // Header
-  sh.getRange(row,1,1,cols).merge()
-    .setValue('Notes and Assumptions')
-    .setFontWeight('bold')
-    .setBackground('#EEE');
-  row++;
-
-  const notesLines  = (notesText ? notesText.split('\n').filter(Boolean) : []);
-  const manualLines = (manualExclusionsArr || []).filter(Boolean);
-  const autoLines   = (autoExclusionsArr   || []).filter(Boolean);
-
-  const parts = [];
-
-  // Notes list
-  if (notesLines.length) parts.push(...notesLines.map(s => '• ' + s));
-
-  // Manual exclusions
-  if (manualLines.length) {
-    if (parts.length) parts.push('', '');
-    parts.push('Exclusions:');
-    parts.push(...manualLines.map(s => '• ' + s));
-  }
-
-  // Auto “Not included in the quote”
-  if (autoLines.length) {
-    if (parts.length) parts.push('', '');
-    parts.push('Not included in the quote:');
-    parts.push(...autoLines.map(s => '• ' + s));
-  }
-
-  const body = parts.length ? parts.join('\n') : '—';
-
-  const bodyRange = sh.getRange(row,1,1,cols).merge();
-  bodyRange
-    .setValue(body)
-    .setWrap(true)
-    .setVerticalAlignment('top')
-    .setHorizontalAlignment('left');
-
-  // Border around section
-  sh.getRange(row-1,1,2,cols).setBorder(true,true,true,true,true,true);
-
-  return row + 2;
+/** Layout rows per division */
+function layout(div){
+  const base = 10;
+  const info = base + 1;
+  const band = base + 2;
+  const head = base + 3;
+  const data = base + 4;
+  const sub  = data + div.lines;
+  const nweTop = sub + 2;
+  return { base, info, band, head, data, sub, nweTop };
 }
 
-/* --- Auto exclusions aggregation --- */
+/** Menu */
+function onOpen(){
+  const ui = SpreadsheetApp.getUi();
+  ui.createMenu('Estimating')
+    .addItem('Setup once', 'Setup_Once')
+    .addSeparator()
+    .addItem('Build summary', 'Build_Summary')
+    .addSubMenu(
+      ui.createMenu('Download')
+        .addItem('Project Tasks CSV', 'Download_Project_Tasks_CSV')
+        .addItem('Estimation CSV', 'Download_Estimation_CSV')
+    )
+    .addToUi();
 
-function dedupeAutoExclusions_(lines) {
-  const byKey = {};
-  lines.forEach(x => {
-    const division = (x.costAccountGroup === 'S') ? 'Subtrade' : divisionFromCostCode(x.costCode);
-    const desc = x.description || x.projectTask || '';
-    const typ  = x.costAccountGroup === 'L' ? 'Labour'
-               : x.costAccountGroup === 'MQ' ? 'Material'
-               : x.costAccountGroup === 'S' ? 'Subtrade'
-               : 'Other';
-    const key = `${division}||${desc}`;
-    if (!byKey[key]) byKey[key] = {division, description: desc, types: new Set()};
-    byKey[key].types.add(typ);
-  });
-
-  return Object.values(byKey)
-    .map(e => ({ division: e.division, description: e.description, type: joinTypes(Array.from(e.types)) }))
-    .sort((a,b) => a.division.localeCompare(b.division) || a.description.localeCompare(b.description));
+  // keep admin tabs hidden each time the file opens (optional, but handy)
+  Hide_Admin_Sheets();
 }
 
-function formatAutoExclusionsWithDiv_(rows) {
-  return rows.map(x => `[${x.division}] ${x.type} for ${x.description}`).filter(Boolean);
-}
 
-function joinTypes(arr){
-  const hasL = arr.includes('Labour');
-  const hasM = arr.includes('Material');
-  const hasS = arr.includes('Subtrade');
-  if ((hasL && hasM) || (hasS && (hasL || hasM))) return 'Mixed';
-  if (hasS) return 'Subtrade';
-  if (hasL && hasM) return 'Labour & Material';
-  if (hasL) return 'Labour';
-  if (hasM) return 'Material';
-  return 'Other';
-}
+/** Edit events */
+function onEdit(e){
+  try{
+    const sh = e && e.range && e.range.getSheet(); if (!sh) return;
+    const name = sh.getName();
 
-/* ---------------- scope, notes, exclusions (from Scope of Work tab) ---------------- */
-
-function readScopesNotesExclusions() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sh = ss.getSheetByName(SET.scopeSheet);
-  const out = { scopes: {}, notes: '', exclusions: [] };
-  if (!sh) return out;
-
-  const lastRow = sh.getLastRow();
-  const lastCol = sh.getLastColumn();
-  if (lastRow < 2 || lastCol < 1) return out;
-
-  // headers row 1
-  const headers = sh.getRange(1,1,1,lastCol).getValues()[0]
-    .map(v => (v||'').toString().trim().toLowerCase());
-
-  function readColumnTextByHeader(headerNeedle) {
-    const idx = headers.findIndex(h => h.includes(headerNeedle.toLowerCase()));
-    if (idx < 0) return '';
-    const col = idx + 1;
-    const values = sh.getRange(2, col, lastRow - 1, 1).getValues()
-      .map(r => (r[0] || '').toString().trim())
-      .filter(Boolean);
-    return values.join('\n');
-  }
-
-  function readColumnArrayByHeader(headerNeedle) {
-    const idx = headers.findIndex(h => h.includes(headerNeedle.toLowerCase()));
-    if (idx < 0) return [];
-    const col = idx + 1;
-    return sh.getRange(2, col, lastRow - 1, 1).getValues()
-      .map(r => (r[0] || '').toString().trim())
-      .filter(Boolean);
-  }
-
-  out.scopes['Construction'] = readColumnTextByHeader('construction scope of work');
-  out.scopes['Electrical']   = readColumnTextByHeader('electrical scope of work');
-  out.scopes['HVAC']         = readColumnTextByHeader('hvac scope of work');
-  out.scopes['Plumbing']     = readColumnTextByHeader('plumbing scope of work');
-  out.scopes['Subtrade']     = readColumnTextByHeader('subtrade');
-
-  out.notes       = readColumnTextByHeader('notes');
-  out.exclusions  = readColumnArrayByHeader('exclusions');
-
-  return out;
-}
-
-/* ---------------- crunching logic ---------------- */
-
-function crunch(rows) {
-  const tasks = {};
-  const divisions = {};
-  const exclusions = [];
-  const quality = [];
-
-  rows.forEach(line => {
-    const qty = Number(line.quantity || 0);
-
-    // authoritative quantity rule
-    if (qty === 0) {
-      exclusions.push(line);
-      logExclude(line, 'quantity equals zero');
+    // If any Template sheet is edited, refresh validations & mirrors everywhere
+    if ([S_TPL_P,S_TPL_E,S_TPL_C,S_TPL_H].includes(name)){
+      applyTaskValidationAll();
+      ensureMirrorListAll_();
       return;
     }
 
-    const extCost  = nonZero(line.extCost)  ? line.extCost  : qty * (line.unitCost  || 0);
-    const extPrice = nonZero(line.extPrice) ? line.extPrice : qty * (line.unitPrice || 0);
-    const discount = line.discountAmount || 0;
+    const div = DIVS.find(d => d.sheet === name); if (!div) return;
 
-    const lineHasValue = (qty > 0) || (extCost > 0) || (extPrice > 0);
-    const lineDiv = (line.costAccountGroup === 'S') ? 'Subtrade' : divisionFromCostCode(line.costCode);
-
-    if (extPrice < extCost) quality.push({ reason: 'price lower than cost', line });
-    if (!line.costCode && line.costAccountGroup !== 'S') quality.push({ reason: 'missing cost code', line });
-
-    const taskKey = line.projectTask || '(no task)';
-    if (!tasks[taskKey]) tasks[taskKey] = makeEmptyTask(taskKey, lineDiv, line.description);
-    const t = tasks[taskKey];
-
-    // prefer division and description from lines with value
-    if (lineHasValue && lineDiv && t.division !== lineDiv &&
-       (t.division === 'Construction' || t.division === '(no div)' || t.division === '')) {
-      t.division = lineDiv;
+    // Template picker at B8
+    if (e.range.getA1Notation() === 'B8'){
+      const v = String(e.range.getValue()||'').trim().toLowerCase();
+      if (v === 'no template'){
+        clearDivisionInputs(div);
+        sh.getRange('D8').setValue('Last loaded: ' + new Date());
+      } else if (
+        (v === 'plumbing'   && div.key === 'PLU') ||
+        (v === 'hvac'       && div.key === 'MEC') ||
+        (v === 'electrical' && div.key === 'ELE') ||
+        (v === 'construction' && div.key === 'CON')
+      ){
+        Load_From_Template_For_Div(div);
+      }
+      return;
     }
-    if (lineHasValue && line.description) t.description = line.description;
 
-    // bucket by type
-    const bucket = line.costAccountGroup === 'L'
-      ? t.labour
-      : line.costAccountGroup === 'MQ'
-        ? t.material
-        : t.other;
 
-    bucket.qty      += qty;
-    bucket.cost     += extCost || 0;
-    bucket.price    += extPrice || 0;
-    bucket.discount += discount || 0;
+    // When user picks a Description in the visible dropdown (column D)
+    const L = layout(div);
+    const row = e.range.getRow();
+    const col = e.range.getColumn();
+    if (row >= L.data && row < L.data + div.lines && col === COL.DESC){
+      const descPick = String(e.range.getValue()||'').trim();
+      if (descPick) fillFromPick_(div, sh, row, descPick);
+      return;
+    }
 
-    // division totals
-    divisions[lineDiv] = divisions[lineDiv] || makeEmptyDiv(lineDiv);
-    const d = divisions[lineDiv];
-    d.cost          += extCost || 0;
-    d.price         += extPrice || 0;
-    d.discount      += discount || 0;
-    d.labourCost    += line.costAccountGroup === 'L'  ? extCost  : 0;
-    d.materialCost  += line.costAccountGroup === 'MQ' ? extCost  : 0;
-    d.labourPrice   += line.costAccountGroup === 'L'  ? extPrice : 0;
-    d.materialPrice += line.costAccountGroup === 'MQ' ? extPrice : 0;
+    // Edit guard until a Task ID has been set into the hidden helper
+    enforceTaskRequirement_(e, div);
+  }catch(_){}
+}
 
-    if (line.costAccountGroup === 'L') {
-      const lUC = qty ? (extCost / qty) : 0;
-      const lUS = qty ? (extPrice / qty) : 0;
-      if (lUC) pushUnique(d.labourCostRates, round2(lUC));
-      if (lUS) pushUnique(d.labourSellRates, round2(lUS));
+/** Block editing of key money and description fields until a Task is set */
+function enforceTaskRequirement_(e, div){
+  const sh = e.range.getSheet();
+  const L  = layout(div);
+  const row = e.range.getRow();
+  const col = e.range.getColumn();
+  const criticalCols = [COL.DESC, COL.LBR_HRS, COL.MAT_COST, COL.SUBS_COST, COL.MK, COL.RATE];
+
+  if (row < L.data || row >= L.data + div.lines) return;
+  if (!criticalCols.includes(col)) return;
+
+  const task = String(sh.getRange(row, COL.TASK).getValue()||'').trim(); // hidden helper column
+  const newVal = e.value;
+  if (!task && newVal && String(newVal).trim() !== ''){
+    e.range.setValue('');
+    e.source.toast('Pick an Item in column D first.', 'Task required', 5);
+  }
+}
+
+/** One time setup */
+function Setup_Once(){
+  const ss = SpreadsheetApp.getActive();
+  [S_SUM,S_CAT,S_TPL_P,S_TPL_E,S_TPL_C,S_TPL_H,S_SET,S_SCOPE,S_LOG,S_LIB,S_SRC_TASKS,S_SRC_REV,S_SRC_COST,S_PRICING]
+    .forEach(n => wipeOrCreate(ss, n));
+  DIVS.forEach(d => { const sh = wipeOrCreate(ss, d.sheet); unmergeAll(sh); });
+
+  setupSettings();
+  ensureLogSheet_();
+  DIVS.forEach(d => buildPricingSheet(d));
+  buildPricingBookSheet();
+
+  seedCatalog();
+  seedNotesLibrary();
+  seedPlumbingTemplate();
+  seedElectricalTemplate();  // new
+  seedHVACTemplate();        // new
+  seedEmptyTemplateSheet(S_TPL_C);
+  seedSourceSheets();
+
+  // Default template pickers
+  DIVS.forEach(d => {
+    const sh = SpreadsheetApp.getActive().getSheetByName(d.sheet);
+    sh.getRange('B8').setValue('No Template');
+  });
+
+  // Apply dropdowns & mirrors
+  applyTaskValidationAll();
+  ensureMirrorListAll_();
+  // Apply dropdowns & mirrors
+  applyTaskValidationAll();
+  ensureMirrorListAll_();
+
+  // Hide back-office tabs by default
+  Hide_Admin_Sheets();
+
+  logMsg('Setup complete');
+}
+
+/** Settings */
+function setupSettings(){
+  const sh = SpreadsheetApp.getActive().getSheetByName(S_SET);
+  sh.clear({contentsOnly:true});
+  sh.getRange('A1').setValue('Settings').setFontWeight('bold');
+  sh.getRange(3,1,8,2).setValues([
+    ['Labor Rate COST per Hr',          85],
+    ['Default Rate SELL per Hr',       140],
+    ['Default Markup percent',          0.50],
+    ['Default Tax Category',           ''],
+    ['Estimate Version',               0],
+    ['Default Planned Start Date',     ''],
+    ['Default Planned End Date',       ''],
+    ['Export folder created',          EXPORT_FOLDER]
+  ]);
+}
+
+/** Build a division sheet */
+function buildPricingSheet(div){
+  const sh = SpreadsheetApp.getActive().getSheetByName(div.sheet);
+  sh.clear({contentsOnly:true});
+  unmergeAll(sh);
+  ensureCols(sh, Math.max(colIndex(STORY_COL_END), 60)); // at least AD; ~60 cols total
+  safeSetColWidths(sh, 1, 60, 110);
+  sh.setFrozenRows(6);
+
+  // Header
+  sh.getRange('B1').setValue(div.name).setFontSize(13).setFontWeight('bold');
+  sh.getRange('B2:C6').setValues([['Client',''],['Project',''],['Opportunity',''],['Estimator',''],['Date','=TODAY()']]);
+
+  // Template block rows 7 and 8
+  mergeSafeSet(sh.getRange('B7:G7'), 'Template')
+    .setFontWeight('bold').setBackground('#EDEDED')
+    .setHorizontalAlignment('center').setBorder(true,true,true,true,true,true);
+  sh.getRange('B8')
+    .setDataValidation(SpreadsheetApp.newDataValidation().requireValueInList(templateOptions(div), true).build())
+    .setValue('No Template');
+  sh.getRange('D8').setValue('Last loaded: (none)');
+
+  const L = layout(div);
+
+  // Bars (division, info)
+  mergeSafeSet(sh.getRange(L.base,2,1,12), div.name).setBackground(div.color).setFontWeight('bold');
+  mergeSafeSet(sh.getRange(L.info,2,1,12))
+    .setFormula('="Estimator  "&$C$5&"   Per-line labor COST rate comes from template   Markup percent per line"')
+    .setBackground('#F2F2F2');
+
+  // Working and Selling bands
+  mergeSafeSet(sh.getRange(L.band,2,1,3), 'Working').setHorizontalAlignment('center').setFontWeight('bold');
+  const sellingWidth = COL.SELL - COL.MAT_COST + 1; // K..N
+  mergeSafeSet(sh.getRange(L.band, COL.MAT_COST, 1, sellingWidth), 'Selling').setHorizontalAlignment('center').setFontWeight('bold');
+
+  // Headers (no "Selling Final")
+  const hdr = ['Trade','Item','Description','LBR Hrs','Mat Cost','Subs','Cost','Mk percent','Rate per Hr','$ Material','Subs','$ Hrs','Selling'];
+  sh.getRange(L.head,2,1,hdr.length).setValues([hdr]).setFontWeight('bold').setBackground(COLORS.HDR)
+    .setHorizontalAlignment('center').setBorder(true,true,true,true,true,true);
+
+  // Data rows and formulas
+  sh.getRange(L.data, COL.INC, div.lines, 1).insertCheckboxes().setValues(Array.from({length:div.lines}, ()=>[true]));
+  sh.hideColumns(COL.INC);
+  sh.getRange(L.data, COL.MK,   div.lines, 1).setFormulaR1C1('=Settings!R5C2');
+  sh.getRange(L.data, COL.RATE, div.lines, 1).setFormulaR1C1('=Settings!R4C2');
+  sh.getRange(L.data, COL.SECTION, div.lines, 1).setValue(div.key);
+
+  // Hide helpers and the legacy column O
+  hideHelperCols_(sh); 
+  sh.hideColumns(COL.SELL_UNUSED, 1); // hide old "Selling Final" (O)
+
+  // COST = (LBR_HRS * per-line cost rate W) + Mat + Subs; falls back to Settings!B3 if W blank
+  sh.getRange(L.data, COL.COST, div.lines, 1)
+    .setFormulaR1C1('=RC[-3]*IF(RC[15]="", Settings!R3C2, RC[15]) + RC[-2] + RC[-1]');
+
+  // $Material, $Subs, $Hrs, Selling
+  sh.getRange(L.data, COL.SELL_MAT, div.lines, 1).setFormulaR1C1('=RC[-5]*(1+RC[-2])');
+  sh.getRange(L.data, COL.SELL_SUB, div.lines, 1).setFormulaR1C1('=RC[-5]*(1+RC[-3])');
+  sh.getRange(L.data, COL.SELL_HRS, div.lines, 1).setFormulaR1C1('=RC[-8]*RC[-3]');
+  sh.getRange(L.data, COL.SELL,     div.lines, 1).setFormulaR1C1('=RC[-3]+RC[-2]+RC[-1]');
+
+  // Formats
+  const moneyCols = [COL.MAT_COST,COL.SUBS_COST,COL.COST,COL.RATE,COL.SELL_MAT,COL.SELL_SUB,COL.SELL_HRS,COL.SELL];
+  moneyCols.forEach(c => sh.getRange(L.data, c, div.lines, 1).setNumberFormat('$#,##0.00').setHorizontalAlignment('right'));
+  sh.getRange(L.data, COL.LBR_HRS, div.lines, 1).setNumberFormat('0.0').setHorizontalAlignment('right');
+  sh.getRange(L.data, COL.MK,      div.lines, 1).setNumberFormat('0.0%').setHorizontalAlignment('right');
+  sh.getRange(L.data, COL.DESC,    div.lines, 1).setWrap(true);
+  sh.setRowHeights(L.data, div.lines, 22);
+
+  // Numeric only validation
+  const numVal = SpreadsheetApp.newDataValidation().requireNumberGreaterThanOrEqualTo(0).setAllowInvalid(false).setHelpText('Numbers only').build();
+  [COL.LBR_HRS, COL.MAT_COST, COL.SUBS_COST].forEach(c => sh.getRange(L.data, c, div.lines, 1).setDataValidation(numVal));
+
+  // Subtotals row
+  const cLbr = colLetter(COL.LBR_HRS), cMat = colLetter(COL.MAT_COST), cSub = colLetter(COL.SUBS_COST);
+  const cCost = colLetter(COL.COST), cSm  = colLetter(COL.SELL_MAT), cSs = colLetter(COL.SELL_SUB), cSh  = colLetter(COL.SELL_HRS);
+  const cSell = colLetter(COL.SELL);
+
+  mergeSafeSet(sh.getRange(L.sub,2,1,2), 'Subtotals').setFontWeight('bold').setBackground(COLORS.SUB).setBorder(true,true,true,true,true,true);
+  sh.getRange(L.sub, COL.LBR_HRS).setFormula(`=SUM(${cLbr}${L.data}:${cLbr}${L.sub-1})`).setNumberFormat('0.0');
+  sh.getRange(L.sub, COL.MAT_COST).setFormula(`=SUM(${cMat}${L.data}:${cMat}${L.sub-1})`).setNumberFormat('$#,##0.00');
+  sh.getRange(L.sub, COL.SUBS_COST).setFormula(`=SUM(${cSub}${L.data}:${cSub}${L.sub-1})`).setNumberFormat('$#,##0.00');
+  sh.getRange(L.sub, COL.COST).setFormula(`=SUM(${cCost}${L.data}:${cCost}${L.sub-1})`).setNumberFormat('$#,##0.00');
+  sh.getRange(L.sub, COL.SELL_MAT).setFormula(`=SUM(${cSm}${L.data}:${cSm}${L.sub-1})`).setNumberFormat('$#,##0.00');
+  sh.getRange(L.sub, COL.SELL_SUB).setFormula(`=SUM(${cSs}${L.data}:${cSs}${L.sub-1})`).setNumberFormat('$#,##0.00');
+  sh.getRange(L.sub, COL.SELL_HRS).setFormula(`=SUM(${cSh}${L.data}:${cSh}${L.sub-1})`).setNumberFormat('$#,##0.00');
+  sh.getRange(L.sub, COL.SELL).setFormula(`=SUM(${cSell}${L.data}:${cSell}${L.sub-1})`).setNumberFormat('$#,##0.00');
+
+  // KPI card — only H & I merged for the title (per your preference)
+  mergeSafeSet(sh.getRange('H2:I2'), 'Totals').setFontWeight('bold').setFontSize(12)
+    .setHorizontalAlignment('center').setBackground('#FFF2CC').setBorder(true,true,true,true,true,true);
+  sh.getRange('H3').setValue('Total Cost').setFontWeight('bold');
+  sh.getRange('H4').setValue('Markup percent').setFontWeight('bold');
+  sh.getRange('H5').setValue('Margin percent').setFontWeight('bold');
+  sh.getRange('H6').setValue('Total Sell').setFontWeight('bold');
+
+  sh.getRange('I3').setFormula(`=${cCost}${L.sub}`).setNumberFormat('$#,##0.00').setFontSize(12).setFontWeight('bold');
+  sh.getRange('I4').setFormula(`=IF(${cCost}${L.sub}>0,(${cSell}${L.sub}-${cCost}${L.sub})/${cCost}${L.sub},"")`).setNumberFormat('0.0%').setFontSize(12).setFontWeight('bold');
+  sh.getRange('I5').setFormula(`=IF(${cSell}${L.sub}>0,(${cSell}${L.sub}-${cCost}${L.sub})/${cSell}${L.sub},"")`).setNumberFormat('0.0%').setFontSize(12).setFontWeight('bold');
+  sh.getRange('I6').setFormula(`=${cSell}${L.sub}`).setNumberFormat('$#,##0.00').setFontSize(12).setFontWeight('bold');
+
+  // Story panel at X..AD (merge each line across its row)
+  mergeSafeSet(sh.getRange(storyHeaderRange()), 'Client facing story one line per row')
+    .setHorizontalAlignment('center').setFontWeight('bold').setBackground('#EEF3FF').setBorder(true,true,true,true,true,true);
+  const storyTop = STORY_ROWS_TOP, storyBot = STORY_ROWS_LAST;
+  for (let r = storyTop; r <= storyBot; r++){
+    mergeSafeSet(sh.getRange(`${STORY_COL_START}${r}:${STORY_COL_END}${r}`), '');
+  }
+  sh.getRange(storyLinesRange()).setWrap(true);
+
+  // Notes panel (Notes, Warranty, Exclusions included)
+  renderNWEPanel(sh, div);
+
+  // Picker & CF
+  applyTaskValidationToSheet_(sh, div); // dropdown in D
+  ensureMirrorList_(sh, div);           // local list in V
+  applyDescInvalidHighlight_(sh, div);  // conditional format (same-sheet)
+}
+
+function buildPricingBookSheet(){
+  const ss = SpreadsheetApp.getActive();
+  let sh = ss.getSheetByName(S_PRICING);
+  if (!sh) sh = ss.insertSheet(S_PRICING);
+
+  sh.clear({ contentsOnly: true });
+  sh.clearFormats();
+  ensureCols(sh, 30);
+  ensureRows(sh, 80);
+  safeSetColWidths(sh, 1, 12, 110);
+  sh.setFrozenRows(12);
+
+  sh.getRange('B2').setValue('Ceiling Tile Pricing Book').setFontSize(13).setFontWeight('bold');
+  sh.getRange('D2').setValue('Tile module').setFontWeight('bold');
+  const moduleCell = sh.getRange('E2');
+  moduleCell.setDataValidation(SpreadsheetApp.newDataValidation().requireValueInList(['2x2', '2x4'], true).build());
+  if (!moduleCell.getValue()) moduleCell.setValue('2x4');
+
+  sh.getRange('A3:A10').setValues([
+    ['Side 1 Ft'],
+    ['Side 2 Ft'],
+    ['Deck Height Ft'],
+    ['Ceiling Height Ft'],
+    ['Drop Height Ft'],
+    ['No. of rooms'],
+    ['Perimeter Ft'],
+    ['Area Ft²']
+  ]).setFontWeight('bold');
+
+  sh.getRange('B3:B6').clearContent();
+  sh.getRange('B7').setFormula('=IF(AND($B$5<>"", $B$6<>""), $B$5-$B$6, "")');
+  sh.getRange('B8').setValue(1);
+  sh.getRange('B9').setFormula('=IF(AND($B$3<>"", $B$4<>""), ROUND(2*($B$3+$B$4)*$B$8, 2), "")');
+  sh.getRange('B10').setFormula('=IF(AND($B$3<>"", $B$4<>""), ROUND($B$3*$B$4*$B$8, 2), "")');
+
+  sh.getRange('B14:J14').setValues([[
+    'Item description','Quantity','Unit','Yield Unit','Yield Unit (value)','Cost','Quantity needed','Quantity to order','Total cost'
+  ]]).setFontWeight('bold').setBackground('#D9E1F2');
+
+  // Tile row
+  sh.getRange('B15').setFormula("=IF($E$2=\"2x4\",\"2' x 4' Ceiling tile\",\"2' x 2' Ceiling tile\")");
+  sh.getRange('C15').setFormula('=IF($B$10="","",ROUND($B$10,2))');
+  sh.getRange('D15').setValue('SF');
+  sh.getRange('E15').setValue('SF per case');
+  sh.getRange('F15').setValue(64);
+  sh.getRange('G15').setFormula('=IF($E$2="2x4",89,132)');
+  sh.getRange('H15').setFormula('=IF(C15="","",ROUND(C15/F15,2))');
+  sh.getRange('I15').setFormula('=IF(H15="","",CEILING(H15,1))');
+  sh.getRange('J15').setFormula('=IF(I15="","",ROUND(I15*G15,2))');
+
+  // Wall moulding
+  sh.getRange('B16').setValue('Ceiling tile wall moulding');
+  sh.getRange('C16').setFormula('=IF($B$9="","",ROUND($B$9,2))');
+  sh.getRange('D16').setValue('LF');
+  sh.getRange('E16').setValue('LF per stick');
+  sh.getRange('F16').setValue(10);
+  sh.getRange('G16').setValue(13.2);
+  sh.getRange('H16').setFormula('=IF(C16="","",ROUND(C16/F16,2))');
+  sh.getRange('I16').setFormula('=IF(H16="","",CEILING(H16,1))');
+  sh.getRange('J16').setFormula('=IF(I16="","",ROUND(I16*G16,2))');
+
+  // Main tee
+  sh.getRange('B17').setValue('Main tee fire rated');
+  sh.getRange('C17').setFormula('=IF($B$10="","",ROUND($B$10*IF($E$2="2x4",0.50,0.30),2))');
+  sh.getRange('D17').setValue('LF');
+  sh.getRange('E17').setValue('LF per piece');
+  sh.getRange('F17').setValue(8);
+  sh.getRange('G17').setValue(11.87);
+  sh.getRange('H17').setFormula('=IF(C17="","",ROUND(C17/F17,2))');
+  sh.getRange('I17').setFormula('=IF(H17="","",CEILING(H17,1))');
+  sh.getRange('J17').setFormula('=IF(I17="","",ROUND(I17*G17,2))');
+
+  // Cross tee
+  sh.getRange('B18').setValue('Cross tee fire rated');
+  sh.getRange('C18').setFormula('=IF($B$10="","",ROUND($B$10*IF($E$2="2x4",0.25,0.40),2))');
+  sh.getRange('D18').setValue('LF');
+  sh.getRange('E18').setValue('LF per piece');
+  sh.getRange('F18').setValue(2);
+  sh.getRange('G18').setValue(2.98);
+  sh.getRange('H18').setFormula('=IF(C18="","",ROUND(C18/F18,2))');
+  sh.getRange('I18').setFormula('=IF(H18="","",CEILING(H18,1))');
+  sh.getRange('J18').setFormula('=IF(I18="","",ROUND(I18*G18,2))');
+
+  // Wire
+  sh.getRange('B19').setValue('Hanging wire 18 Gauge');
+  sh.getRange('C19').setFormula('=IF($B$10="","",ROUND($B$10*0.28,2))');
+  sh.getRange('D19').setValue('LF');
+  sh.getRange('E19').setValue('LF per bundle');
+  sh.getRange('F19').setValue(300);
+  sh.getRange('G19').setValue(27.4);
+  sh.getRange('H19').setFormula('=IF(C19="","",ROUND(C19/F19,2))');
+  sh.getRange('I19').setFormula('=IF(H19="","",CEILING(H19,1))');
+  sh.getRange('J19').setFormula('=IF(I19="","",ROUND(I19*G19,2))');
+
+  // Nails
+  sh.getRange('B20').setValue('Concrete nails');
+  sh.getRange('C20').setFormula('=IF($B$10="","",ROUND($B$10*0.0375,2))');
+  sh.getRange('D20').setValue('Units');
+  sh.getRange('E20').setValue('Units per box');
+  sh.getRange('F20').setValue(100);
+  sh.getRange('G20').setValue(55);
+  sh.getRange('H20').setFormula('=IF(C20="","",ROUND(C20/F20,2))');
+  sh.getRange('I20').setFormula('=IF(H20="","",CEILING(H20,1))');
+  sh.getRange('J20').setFormula('=IF(I20="","",ROUND(I20*G20,2))');
+
+  sh.getRange('G15:G20').setNumberFormat('$#,##0.00');
+  sh.getRange('J15:J20').setNumberFormat('$#,##0.00');
+  sh.getRange('H15:H20').setNumberFormat('0.00');
+  sh.getRange('I15:I20').setNumberFormat('0');
+
+  sh.getRange('N14').setValue('Material totals').setFontWeight('bold');
+  sh.getRange('N15:N18').setValues([
+    ['Total cost'],
+    ['Total cost w/ add'],
+    ['Total cost + 5%'],
+    ['Total per Ft²']
+  ]);
+  sh.getRange('O15').setFormula('=ROUND(SUM($J$15:$J$20),2)');
+  sh.getRange('O16').setFormula('=IF($B$10<1000, O15*1.1, O15) + (J16*$B$8*0.05)');
+  sh.getRange('O17').setFormula('=IF(O16="",0,ROUND(O16*1.05,2))');
+  sh.getRange('O18').setFormula('=IF($B$10<=0,"",ROUND(IFERROR(O17/$B$10,0),2))');
+  sh.getRange('O15:O17').setNumberFormat('$#,##0.00');
+  sh.getRange('O18').setNumberFormat('$#,##0.00');
+
+  sh.getRange('B24').setValue('Labour inputs').setFontWeight('bold');
+  sh.getRange('B25:B30').setValues([
+    ['Area (SF)'],
+    ['Hours per 1000 SF'],
+    ['Drop height adjustment'],
+    ['Room factor %'],
+    ['Total hours w/ room'],
+    ['Hour cost $']
+  ]);
+  sh.getRange('C25').setFormula('=$B$10');
+  sh.getRange('C26').setValue(12);
+  sh.getRange('C27').setFormula('=IF($B$7="",0,ROUND($B$7/40,3))');
+  sh.getRange('C28').setValue(0);
+  sh.getRange('C28').setNumberFormat('0.0%');
+  sh.getRange('C29').setFormula('=IF(C25="",0,ROUND((((C25/1000)*C26)+C27)*(1+C28),3))');
+  sh.getRange('C30').setValue(85).setNumberFormat('$#,##0.00');
+  sh.getRange('C29').setNumberFormat('0.000');
+
+  sh.getRange('B33').setValue('Description').setFontWeight('bold');
+  sh.getRange('C33').setFormula('=IF($B$10="","",TEXTJOIN(" ",TRUE,"Supply and install acoustic ceiling system",$E$2,TEXT($B$10,"0.00"),"SF","perimeter",TEXT($B$9,"0.00"),"LF"))');
+
+  sh.getRange('B36').setValue('Staging (ready to push)').setFontWeight('bold');
+  sh.getRange('B37:B48').setValues([
+    ['Description'],
+    ['Labour Hours'],
+    ['Material Cost'],
+    ['Subs'],
+    ['Markup'],
+    ['Rate per Hr'],
+    ['Task'],
+    ['Cost Code'],
+    ['UOM'],
+    ['Cost Rate Hr'],
+    ['Area SF'],
+    ['Unit Cost per SF']
+  ]);
+  sh.getRange('C37').setFormula('=C33');
+  sh.getRange('C38').setFormula('=C29');
+  sh.getRange('C39').setFormula('=O17');
+  sh.getRange('C40').setValue(0);
+  sh.getRange('C41').setValue(0.5);
+  sh.getRange('C42').setValue(140);
+  sh.getRange('C43').setValue('CCEILTILE');
+  sh.getRange('C44').setFormula('="09-5113"');
+  sh.getRange('C45').setValue('SQFT');
+  sh.getRange('C46').setValue(85);
+  sh.getRange('C47').setFormula('=$B$10').setNumberFormat('0.00');
+  sh.getRange('C48').setFormula('=O18');
+  sh.getRange('C38').setNumberFormat('0.000');
+  sh.getRange('C39:C40').setNumberFormat('$#,##0.00');
+  sh.getRange('C41').setNumberFormat('0.0%');
+  sh.getRange('C42').setNumberFormat('$#,##0.00');
+  sh.getRange('C46').setNumberFormat('$#,##0.00');
+  sh.getRange('C48').setNumberFormat('$#,##0.00');
+
+  sh.getRange('B50').setValue('Perimeter LF');
+  sh.getRange('C50').setFormula('=$B$9').setNumberFormat('0.00');
+  sh.getRange('B51').setValue('Module');
+  sh.getRange('C51').setFormula('=$E$2');
+
+  ensurePricingBookButton_(sh);
+}
+
+function ensurePricingBookButton_(sh){
+  const fn = 'PricingBook_PushToConstruction';
+  const anchorCell = sh.getRange('B4');
+  const row = anchorCell.getRow();
+  const col = anchorCell.getColumn();
+
+  const clearFallback = () => {
+    ['B4', 'B12', 'B53'].forEach(ref => {
+      try { sh.getRange(ref).clearContent().clearFormat(); } catch (_) {}
+    });
+  };
+
+  const anchorButton = (btn) => {
+    if (!btn) return;
+    try {
+      if (typeof btn.setAnchorCell === 'function') {
+        btn.setAnchorCell(anchorCell);
+      } else if (typeof btn.setPosition === 'function') {
+        btn.setPosition(row, col, 0, 0);
+      }
+    } catch (_) {}
+  };
+
+  const matchesMarker = value => String(value || '').toLowerCase().indexOf('push to construction') !== -1;
+
+  // Existing modern buttons
+  if (typeof sh.getButtons === 'function') {
+    const buttons = sh.getButtons();
+    for (let i = 0; i < buttons.length; i++) {
+      const btn = buttons[i];
+      try {
+        const action = typeof btn.getOnClickAction === 'function' ? btn.getOnClickAction() : null;
+        const actionName = action && typeof action.getFunctionName === 'function' ? action.getFunctionName() : null;
+        if (actionName === fn) {
+          btn.setOnClickAction(SpreadsheetApp.newAction().setFunctionName(fn));
+          anchorButton(btn);
+          clearFallback();
+          return btn;
+        }
+      } catch (_) {}
+    }
+  }
+
+  // Legacy drawings
+  try {
+    const drawings = sh.getDrawings();
+    for (let i = 0; i < drawings.length; i++) {
+      const drawing = drawings[i];
+      try {
+        const currentAction = typeof drawing.getOnAction === 'function' ? drawing.getOnAction() : null;
+        if (currentAction === fn || !currentAction) {
+          if (typeof drawing.assignScript === 'function') {
+            drawing.assignScript(fn);
+          } else if (typeof drawing.setOnAction === 'function') {
+            drawing.setOnAction(fn);
+          }
+          drawing.setPosition(row, col, 0, 0);
+          clearFallback();
+          return drawing;
+        }
+      } catch (_) {}
+    }
+  } catch (_) {}
+
+  // Images acting as buttons
+  if (typeof sh.getImages === 'function') {
+    const images = sh.getImages();
+    for (let i = 0; i < images.length; i++) {
+      const image = images[i];
+      try {
+        const title = typeof image.getAltTextTitle === 'function' ? image.getAltTextTitle() : '';
+        const desc = typeof image.getAltTextDescription === 'function' ? image.getAltTextDescription() : '';
+        const anchor = typeof image.getAnchorCell === 'function' ? image.getAnchorCell() : null;
+        const anchored = anchor && anchor.getRow() === row && anchor.getColumn() === col;
+        if (anchored || matchesMarker(title) || matchesMarker(desc)) {
+          if (typeof image.assignScript === 'function') {
+            image.assignScript(fn);
+          }
+          if (typeof image.setAltTextTitle === 'function' && !matchesMarker(title)) {
+            image.setAltTextTitle('Push to Construction');
+          }
+          if (typeof image.setAltTextDescription === 'function' && !matchesMarker(desc)) {
+            image.setAltTextDescription('Push Pricing Book staging data to the Construction sheet');
+          }
+          anchorButton(image);
+          clearFallback();
+          return image;
+        }
+      } catch (_) {}
+    }
+  }
+
+  // Create a modern button if the API is available
+  if (typeof SpreadsheetApp.newButton === 'function' &&
+      typeof SpreadsheetApp.newAction === 'function' &&
+      typeof sh.insertButton === 'function') {
+    try {
+      const action = SpreadsheetApp.newAction().setFunctionName(fn);
+      const button = SpreadsheetApp.newButton()
+        .setText('Push to Construction')
+        .setAltText('Push to Construction')
+        .setBackgroundColor('#4CAF50')
+        .setOnClickAction(action)
+        .build();
+      const embedded = sh.insertButton(button);
+      anchorButton(embedded);
+      clearFallback();
+      return embedded;
+    } catch (_) {}
+  }
+
+  // Fallback to drawings
+  if (typeof SpreadsheetApp.newDrawing === 'function' && typeof sh.insertDrawing === 'function') {
+    try {
+      const drawing = SpreadsheetApp.newDrawing();
+      drawing.asTextBox()
+        .setText('Push to Construction')
+        .setFontWeight('bold')
+        .setTextAlignment(SpreadsheetApp.TextAlignment.CENTER);
+      const embeddedDrawing = sh.insertDrawing(drawing);
+      if (typeof embeddedDrawing.assignScript === 'function') {
+        embeddedDrawing.assignScript(fn);
+      } else if (typeof embeddedDrawing.setOnAction === 'function') {
+        embeddedDrawing.setOnAction(fn);
+      }
+      embeddedDrawing.setPosition(row, col, 0, 0);
+      clearFallback();
+      return embeddedDrawing;
+    } catch (_) {}
+  }
+
+  // Slides-generated image fallback
+  if (typeof SlidesApp !== 'undefined' &&
+      typeof SlidesApp.create === 'function' &&
+      typeof sh.insertImage === 'function') {
+    let presentationId = null;
+    try {
+      const presentation = SlidesApp.create('TMP_PricingBook_Button');
+      presentationId = presentation.getId();
+      const slide = presentation.getSlides()[0];
+      const width = 320;
+      const height = 106;
+      const shape = slide.insertShape(SlidesApp.ShapeType.ROUNDED_RECTANGLE, 20, 20, width, height);
+      shape.getFill().setSolidFill('#4CAF50');
+      const line = shape.getLine();
+      if (line) {
+        try { line.setFillColor('#4CAF50'); } catch (_) {}
+        try { line.setWidth(0); } catch (_) {}
+      }
+      const textRange = shape.getText();
+      textRange.setText('Push to Construction');
+      const textStyle = textRange.getTextStyle();
+      if (textStyle) {
+        try { textStyle.setFontSize(18); } catch (_) {}
+        try { textStyle.setBold(true); } catch (_) {}
+        try { textStyle.setForegroundColor('#FFFFFF'); } catch (_) {}
+        try { textStyle.setFontFamily('Roboto'); } catch (_) {}
+      }
+      const paragraphStyle = textRange.getParagraphStyle && textRange.getParagraphStyle();
+      if (paragraphStyle && typeof paragraphStyle.setParagraphAlignment === 'function') {
+        try { paragraphStyle.setParagraphAlignment(SlidesApp.ParagraphAlignment.CENTER); } catch (_) {}
+      }
+
+      const blob = typeof shape.getAs === 'function' ? shape.getAs(MimeType.PNG) : null;
+      if (blob) {
+        const overImage = sh.insertImage(blob, col, row);
+        if (typeof overImage.assignScript === 'function') {
+          overImage.assignScript(fn);
+        }
+        try {
+          const targetWidth = 200;
+          const originalWidth = overImage.getWidth();
+          if (originalWidth && typeof overImage.setWidth === 'function' && typeof overImage.setHeight === 'function') {
+            const scale = targetWidth / originalWidth;
+            overImage.setWidth(targetWidth);
+            const originalHeight = overImage.getHeight();
+            if (originalHeight) overImage.setHeight(Math.round(originalHeight * scale));
+          }
+        } catch (_) {}
+        if (typeof overImage.setAltTextTitle === 'function') {
+          overImage.setAltTextTitle('Push to Construction');
+        }
+        if (typeof overImage.setAltTextDescription === 'function') {
+          overImage.setAltTextDescription('Push Pricing Book staging data to the Construction sheet');
+        }
+        anchorButton(overImage);
+        clearFallback();
+        return overImage;
+      }
+    } catch (_) {
+      // ignore and fall through to reminder
+    } finally {
+      if (presentationId) {
+        try { DriveApp.getFileById(presentationId).setTrashed(true); } catch (_) {}
+      }
+    }
+  }
+
+  // Final reminder if everything fails
+  try {
+    const reminder = sh.getRange('B4');
+    if (!String(reminder.getValue()).trim()) {
+      reminder.setValue('Add a button and assign the script "PricingBook_PushToConstruction"')
+        .setFontWeight('bold')
+        .setBackground('#FFF2CC');
+    }
+  } catch (_) {}
+  return null;
+}
+
+function PricingBook_PushToConstruction(){
+  const ss = SpreadsheetApp.getActive();
+  const pricing = ss.getSheetByName(S_PRICING);
+  if (!pricing) {
+    SpreadsheetApp.getUi().alert('Pricing Book sheet not found. Run Setup_Once first.');
+    return;
+  }
+
+  const val = a1 => pricing.getRange(a1).getValue();
+  const desc = String(val('C37') || '').trim();
+  const labourHours = Number(val('C38'));
+  const materialCost = Number(val('C39'));
+  const subsSource = Number(val('C40'));
+  const subs = Number.isFinite(subsSource) ? subsSource : 0;
+  const markupRaw = Number(val('C41'));
+  const markup = Number.isFinite(markupRaw) ? markupRaw : 0.5;
+  const rateSellRaw = Number(val('C42'));
+  const rateSell = Number.isFinite(rateSellRaw) ? rateSellRaw : 140;
+  const task = String(val('C43') || 'CCEILTILE').trim() || 'CCEILTILE';
+  const costCodeRaw = String(pricing.getRange('C44').getDisplayValue() || '09-5113').trim() || '09-5113';
+  const uom = String(val('C45') || 'SQFT').trim() || 'SQFT';
+  const costRateHrRaw = Number(val('C46'));
+  const costRateHr = Number.isFinite(costRateHrRaw) ? costRateHrRaw : 85;
+  const area = Number(val('C47'));
+  const perimeter = Number(pricing.getRange('C50').getValue()) || 0;
+  const module = String(pricing.getRange('C51').getDisplayValue() || pricing.getRange('E2').getDisplayValue() || '').trim();
+
+  const ssToast = (msg) => ss.toast(msg, 'Pricing Book', 5);
+
+  if (!desc) { ssToast('Description is required before pushing.'); return; }
+  if (!Number.isFinite(labourHours)) { ssToast('Labour Hours must be numeric.'); return; }
+  if (!Number.isFinite(materialCost) || materialCost <= 0) { ssToast('Material Cost must be greater than zero.'); return; }
+  if (!Number.isFinite(area) || area <= 0) { ssToast('Area SF must be greater than zero.'); return; }
+
+  const construction = ss.getSheetByName(S_CON);
+  if (!construction) {
+    SpreadsheetApp.getUi().alert('Construction sheet is missing.');
+    return;
+  }
+
+  const startRow = 14;
+  const descCol = COL.DESC;
+  const lastRow = Math.max(construction.getLastRow(), startRow);
+  let targetRow = -1;
+  if (lastRow >= startRow) {
+    const descValues = construction.getRange(startRow, descCol, lastRow - startRow + 1, 1).getDisplayValues();
+    for (let i = 0; i < descValues.length; i++) {
+      if (!String(descValues[i][0] || '').trim()) {
+        targetRow = startRow + i;
+        break;
+      }
+    }
+  }
+  if (targetRow === -1) {
+    targetRow = lastRow + 1;
+    ensureRows(construction, targetRow);
+  }
+
+  // Populate Construction row
+  construction.getRange(targetRow, COL.INC).setValue(true);
+  construction.getRange(targetRow, COL.PICK).setValue(task);
+  construction.getRange(targetRow, COL.TASK).setValue(task);
+  construction.getRange(targetRow, COL.DESC).setValue(desc);
+  construction.getRange(targetRow, COL.LBR_HRS).setValue(labourHours);
+  construction.getRange(targetRow, COL.MAT_COST).setValue(materialCost);
+  construction.getRange(targetRow, COL.SUBS_COST).setValue(subs);
+  construction.getRange(targetRow, COL.MK).setValue(markup);
+  construction.getRange(targetRow, COL.RATE).setValue(rateSell);
+  construction.getRange(targetRow, COL.UOM).setValue(uom);
+  construction.getRange(targetRow, COL.COST_RATE_HR).setValue(costRateHr);
+  construction.getRange(targetRow, COL.SELL_UNUSED).setValue(area).setNumberFormat('0.00');
+  construction.getRange(targetRow, COL.COST_CODE).setNumberFormat('@').setFormula('="' + costCodeRaw + '"');
+
+  SpreadsheetApp.flush();
+
+  ss.toast('Ceiling tiles line added to Construction row ' + targetRow + '.', 'Success', 5);
+
+  const log = ensureLogSheet_();
+  log.appendRow([new Date(), 'push', area, perimeter, module || '', targetRow]);
+}
+
+/** Notes Warranty Exclusions blocks */
+function renderNWEPanel(sh, div){
+  const L = layout(div);
+  ensureRows(sh, L.nweTop + NWE_ROWS + 5);
+  sh.getRange(L.nweTop, 2, NWE_ROWS + 4, 17).breakApart().clearContent().clearFormat();
+
+  // Title bar
+  mergeSafeSet(sh.getRange(L.nweTop, 2, 1, 17), 'Notes Warranty Exclusions this division')
+    .setFontWeight('bold').setBackground('#EFEFEF')
+    .setBorder(true,true,true,true,true,true);
+
+  const headerRow = L.nweTop + 1;
+
+  // Headers
+  sh.getRange(headerRow,  2, 1, 6).merge().setValue('Notes')
+    .setFontWeight('bold').setBackground(COLORS.HDR)
+    .setBorder(true,true,true,true,true,true);
+  sh.getRange(headerRow,  9, 1, 6).merge().setValue('Warranty')
+    .setFontWeight('bold').setBackground(COLORS.HDR)
+    .setBorder(true,true,true,true,true,true);
+  sh.getRange(headerRow, 16, 1, 3).merge().setValue('Exclusions')
+    .setFontWeight('bold').setBackground(COLORS.HDR)
+    .setBorder(true,true,true,true,true,true);
+
+  // Merge EACH ROW under Notes / Warranty / Exclusions to match header widths
+  for (let r = headerRow + 1; r <= headerRow + NWE_ROWS; r++){
+    mergeSafeSet(sh.getRange(r,  2, 1, 6)).setWrap(true).setVerticalAlignment('top')
+      .setBorder(true,true,true,true,false,false);
+    mergeSafeSet(sh.getRange(r,  9, 1, 6)).setWrap(true).setVerticalAlignment('top')
+      .setBorder(true,true,true,true,false,false);
+    mergeSafeSet(sh.getRange(r, 16, 1, 3)).setWrap(true).setVerticalAlignment('top')
+      .setBorder(true,true,true,true,false,false);
+  }
+}
+
+
+/** Clear input columns */
+function clearDivisionInputs(div){
+  const L = layout(div);
+  const sh = SpreadsheetApp.getActive().getSheetByName(div.sheet);
+  const inputs = [COL.TRADE,COL.PICK,COL.DESC,COL.LBR_HRS,COL.MAT_COST,COL.SUBS_COST,COL.RATE,COL.TASK,COL.COST_CODE,COL.ACCT_GRP,COL.UOM,COL.COST_RATE_HR];
+  inputs.forEach(c => sh.getRange(L.data, c, div.lines, 1).clearContent());
+}
+
+/** Load Plumbing template into the Plumbing sheet */
+function Load_Plumbing_From_Template(){
+  const tpl = SpreadsheetApp.getActive().getSheetByName(S_TPL_P);
+  const last = tpl && tpl.getLastRow ? tpl.getLastRow() : 0;
+  if (last < 2) { SpreadsheetApp.getUi().alert('Template Plumbing is empty.'); return; }
+
+  const data = tpl.getRange(2,1,last-1,11).getValues();
+  const div = DIVS.find(d => d.sheet === S_PLU);
+  const sh  = SpreadsheetApp.getActive().getSheetByName(S_PLU);
+  const L   = layout(div);
+
+  clearDivisionInputs(div);
+
+  const n = Math.min(div.lines, data.length);
+  for (let i=0; i < n; i++){
+    const [task, code, acct, desc, uom, sellRate, costRate] = data[i];
+    sh.getRange(L.data+i, COL.INC).setValue(true);
+    sh.getRange(L.data+i, COL.PICK).setValue(task || '');       // Item shows Task ID
+    sh.getRange(L.data+i, COL.TASK).setValue(task || '');       // hidden Task ID
+    sh.getRange(L.data+i, COL.DESC).setValue(desc || '');
+    sh.getRange(L.data+i, COL.COST_CODE).setValue(code || '');
+    sh.getRange(L.data+i, COL.ACCT_GRP).setValue(String(acct||'').toUpperCase());
+    sh.getRange(L.data+i, COL.UOM).setValue(uom || '');
+    if (sellRate !== '' && sellRate != null) sh.getRange(L.data+i, COL.RATE).setValue(Number(sellRate)||0);
+    if (costRate !== '' && costRate != null) sh.getRange(L.data+i, COL.COST_RATE_HR).setValue(Number(costRate)||0);
+  }
+
+  sh.getRange('D8').setValue('Last loaded: ' + new Date());
+  applyTaskValidationToSheet_(sh, div);
+  ensureMirrorList_(sh, div);
+  applyDescInvalidHighlight_(sh, div);
+}
+
+function Load_From_Template_For_Div(div){
+  const tplName = getTemplateSheetForDivision_(div);
+  const tpl = SpreadsheetApp.getActive().getSheetByName(tplName);
+  if (!tpl || tpl.getLastRow() < 2){
+    SpreadsheetApp.getUi().alert('Template "' + (tplName||'') + '" is empty.');
+    return;
+  }
+
+  const data = tpl.getRange(2,1, tpl.getLastRow()-1, 11).getValues(); // A..K
+  const sh   = SpreadsheetApp.getActive().getSheetByName(div.sheet);
+  const L    = layout(div);
+
+  clearDivisionInputs(div);
+
+  const n = Math.min(div.lines, data.length);
+  for (let i=0; i<n; i++){
+    const [task, code, acct, desc, uom, sellRate, costRate] = data[i];
+    sh.getRange(L.data+i, COL.INC).setValue(true);
+    sh.getRange(L.data+i, COL.PICK).setValue(task || '');            // Item
+    sh.getRange(L.data+i, COL.TASK).setValue(task || '');            // hidden Task
+    sh.getRange(L.data+i, COL.DESC).setValue(desc || '');
+    sh.getRange(L.data+i, COL.COST_CODE).setValue(code || '');
+    sh.getRange(L.data+i, COL.ACCT_GRP).setValue(String(acct||'').toUpperCase());
+    sh.getRange(L.data+i, COL.UOM).setValue(uom || 'HOUR');
+    if (sellRate !== '' && sellRate != null) sh.getRange(L.data+i, COL.RATE).setValue(Number(sellRate)||0);
+    if (costRate !== '' && costRate != null) sh.getRange(L.data+i, COL.COST_RATE_HR).setValue(Number(costRate)||0);
+  }
+
+  sh.getRange('D8').setValue('Last loaded: ' + new Date());
+  applyTaskValidationToSheet_(sh, div);   // Description dropdowns (col D)
+  ensureMirrorList_(sh, div);             // CF local list
+  applyDescInvalidHighlight_(sh, div);
+}
+
+
+/** Dropdown validation to all division sheets */
+function applyTaskValidationAll(){
+  DIVS.forEach(d => {
+    const sh = SpreadsheetApp.getActive().getSheetByName(d.sheet);
+    if (sh) applyTaskValidationToSheet_(sh, d);
+  });
+}
+
+/** Map division to its template sheet name */
+function getTemplateSheetForDivision_(div){
+  if (div.key === 'PLU') return S_TPL_P;
+  if (div.key === 'ELE') return S_TPL_E;
+  if (div.key === 'CON') return S_TPL_C;
+  if (div.key === 'MEC') return S_TPL_H;
+  return null;
+}
+
+/** Apply Description dropdown (column D) */
+function applyTaskValidationToSheet_(sh, div){
+  const L = layout(div);
+  sh.getRange(L.data, COL.DESC, div.lines, 1).clearDataValidations();
+
+  const tplName = getTemplateSheetForDivision_(div);
+  if (!tplName) return;
+
+  const tpl = SpreadsheetApp.getActive().getSheetByName(tplName);
+  if (!tpl) return;
+
+  const maxRow = Math.max(tpl.getLastRow(), 10000);
+  const listRange = tpl.getRange(2,4,Math.max(maxRow-1,1),1); // D2:D Description
+  const dv = SpreadsheetApp.newDataValidation()
+    .requireValueInRange(listRange, true)
+    .setAllowInvalid(false) // hard block outside values
+    .setHelpText('Pick an Item by Description.')
+    .build();
+  sh.getRange(L.data, COL.DESC, div.lines, 1).setDataValidation(dv);
+}
+
+/** Create/refresh the local mirror (hidden col V) of template Descriptions */
+function ensureMirrorList_(sh, div){
+  const tplName = getTemplateSheetForDivision_(div);
+  // Clear old values
+  sh.getRange(2, COL.VAL_LIST, Math.max(0, sh.getMaxRows()-1), 1).clearContent();
+  if (!tplName) { hideHelperCols_(sh); return; }
+  const formula = `=IFERROR(FILTER('${tplName}'!$D$2:$D, LEN('${tplName}'!$D$2:$D)),)`;
+  sh.getRange(2, COL.VAL_LIST).setFormula(formula);
+  hideHelperCols_(sh);
+}
+/** Refresh mirrors for all divisions (called on Setup & template edits) */
+function ensureMirrorListAll_(){ DIVS.forEach(d=>{ const sh=SpreadsheetApp.getActive().getSheetByName(d.sheet); if(sh) ensureMirrorList_(sh,d); }); }
+
+/** When a Description is chosen, fill Item (Task), hidden Task, rates, codes */
+function fillFromPick_(div, sh, row, descPick){
+  const meta = readTplIndexByDesc_(div)[descPick];
+  if (!meta) return;
+  // Item (C) and hidden Task (U)
+  sh.getRange(row, COL.PICK).setValue(meta.task || '');
+  sh.getRange(row, COL.TASK).setValue(meta.task || '');
+
+  // Codes/UOM if blank
+  if (!sh.getRange(row, COL.COST_CODE).getValue()) sh.getRange(row, COL.COST_CODE).setValue(meta.costCode || '');
+  if (!sh.getRange(row, COL.ACCT_GRP).getValue())  sh.getRange(row, COL.ACCT_GRP).setValue(meta.acct || '');
+  if (!sh.getRange(row, COL.UOM).getValue())       sh.getRange(row, COL.UOM).setValue(meta.uom || 'HOUR');
+
+  // Rates: SELL per hour (J) and line COST rate per hour (W)
+  if (meta.sellRate){ sh.getRange(row, COL.RATE).setValue(meta.sellRate); }
+  if (meta.costRate){ sh.getRange(row, COL.COST_RATE_HR).setValue(meta.costRate); }
+}
+
+/** Conditional format on column D against local mirror list (column V) */
+function applyDescInvalidHighlight_(sh, div){
+  const L = layout(div);
+  const rng = sh.getRange(L.data, COL.DESC, div.lines, 1); // D-range
+  const descCol = colLetter(COL.DESC);       // D
+  const listCol = colLetter(COL.VAL_LIST);   // V
+  const formula = `=AND($${descCol}${L.data}<>"", COUNTIF($${listCol}:$${listCol}, $${descCol}${L.data})=0)`;
+
+  const newRule = SpreadsheetApp.newConditionalFormatRule()
+      .setRanges([rng])
+      .whenFormulaSatisfied(formula)
+      .setBackground('#F8D7DA') // light red
+      .setFontColor('#7F1D1D')
+      .build();
+
+  sh.setConditionalFormatRules([newRule]);
+}
+
+/** Build summary with version bump helper */
+function Build_Summary(){
+  const set = SpreadsheetApp.getActive().getSheetByName(S_SET);
+  const v = Number(set.getRange('B7').getValue()||0) + 1;
+  set.getRange('B7').setValue(v);
+  Summary_Rebuild();
+  logMsg('Summary built v' + v);
+}
+
+/** Read story rows */
+function readStoryRows(sh){
+  const vals = sh.getRange(storyLinesRange()).getValues();
+  const rows = vals.map(r => r.map(x => String(x||'').trim()).join(' ').trim()).filter(s => s.length);
+  return rows;
+}
+function a1(r,c){ return colLetter(c) + r; }
+function writeMergedList(sh, startRow, texts){
+  let row = startRow;
+  texts.forEach(t=>{
+    mergeSafeSet(sh.getRange(row,2,1,17), '• ' + t).setWrap(true);
+    row++;
+  });
+  return row;
+}
+
+/** Sentence‑case utility for exclusions (trim + capitalize first letter) */
+function sentenceCase_(s){
+  s = String(s||'').trim();
+  if (!s) return s;
+  const lower = s.toLowerCase();
+  return lower.charAt(0).toUpperCase() + lower.slice(1);
+}
+
+/** Build Summary */
+function Summary_Rebuild(){
+  const sh = SpreadsheetApp.getActive().getSheetByName(S_SUM);
+  if (!sh) return;
+
+  // 1) Clean slate: remove banding/CF/merges/formats/contents
+  try{ sh.getBandings().forEach(b=>b.remove()); }catch(_){}
+  try{ sh.setConditionalFormatRules([]); }catch(_){}
+  unmergeAll(sh);
+  sh.clearFormats();
+  sh.clearContents();
+
+  // Basic sheet framing
+  safeSetColWidths(sh,1,60,120);
+  sh.setFrozenRows(7);
+  sh.getRange('B1').setValue('Estimate Summary')
+    .setFontSize(13).setFontWeight('bold');
+
+  // Header card (kept on E1:F3)
+  const set = SpreadsheetApp.getActive().getSheetByName(S_SET);
+  const ver = Number(set.getRange('B7').getValue()||0);
+  sh.getRange('E1').setValue('Version').setFontWeight('bold');
+  sh.getRange('F1').setValue('v'+ver);
+  sh.getRange('E2').setValue('Built').setFontWeight('bold');
+  sh.getRange('F2').setValue(new Date());
+  sh.getRange('E3').setValue('Grand Total').setFontWeight('bold');
+
+  // 2) Collect Project / Opportunity from first sheet that has them
+  let projectName = '', opportunityId = '';
+  for (const div of DIVS){
+    const src = SpreadsheetApp.getActive().getSheetByName(div.sheet);
+    if (!src) continue;
+    const p = String(src.getRange('C3').getDisplayValue()||'').trim(); // Project
+    const o = String(src.getRange('C4').getDisplayValue()||'').trim(); // Opportunity
+    if (!projectName && p) projectName = p;
+    if (!opportunityId && o) opportunityId = o;
+    if (projectName && opportunityId) break;
+  }
+
+  // 3) We’ll accumulate division-level SELL and COST subtotals to sum later
+  const totalSellCells = [];
+  const totalCostCells = [];
+
+  let row = 9; // sections start here (kept)
+  // ---- Division sections ----
+  DIVS.forEach((div, idx) => {
+    const src = SpreadsheetApp.getActive().getSheetByName(div.sheet);
+    if (!src) return;
+    const L = layout(div);
+
+    const storyRows = readStoryRows(src);
+
+    const range = src.getRange(L.data, COL.TRADE, div.lines, COL.SELL - COL.TRADE + 1).getValues();
+    const data  = range.filter(r =>
+      String(r[IDX_DESC_IN_B2N]).trim() !== '' &&
+      Number(r[IDX_SELL_IN_B2N]) > 0
+    );
+    if (storyRows.length === 0 && data.length === 0) return;
+
+    const secNum = (idx+1).toFixed(2).replace('.00','');
+    mergeSafeSet(sh.getRange(row,2,1,17), `${secNum}.00 ${div.name}`)
+      .setBackground(div.color).setFontWeight('bold').setBorder(true,true,true,true,true,true);
+    row++;
+
+    mergeSafeSet(sh.getRange(row,2,1,17), 'Scope of Work')
+      .setBackground('#EFEFEF').setFontWeight('bold').setBorder(true,true,true,true,true,true);
+    row++;
+
+    storyRows.forEach((t,i)=>{
+      const label = `${secNum}.${String(i+1).padStart(2,'0')} ${t}`;
+      mergeSafeSet(sh.getRange(row,2,1,17), label).setWrap(true);
+      row++;
+    });
+    row++;
+
+    if (data.length){
+      const hdr = ['Trade','Item','Description','LBR Hrs','Mat Cost','Subs','Cost','Mk percent','Rate per Hr','$ Material','Subs','$ Hrs','Selling'];
+      sh.getRange(row,2,1,hdr.length).setValues([hdr]).setFontWeight('bold')
+        .setBackground(COLORS.HDR).setHorizontalAlignment('center')
+        .setBorder(true,true,true,true,true,true);
+      row++;
+
+      sh.getRange(row,2,data.length,data[0].length).setValues(data);
+
+      const startCol = 2;
+      // formats
+      sh.getRange(row, startCol + (COL.LBR_HRS - COL.TRADE), data.length, 1)
+        .setNumberFormat('0.0').setHorizontalAlignment('right');
+      sh.getRange(row, startCol + (COL.MK - COL.TRADE), data.length, 1)
+        .setNumberFormat('0.0%').setHorizontalAlignment('right');
+      [COL.MAT_COST, COL.SUBS_COST, COL.COST, COL.RATE,
+       COL.SELL_MAT, COL.SELL_SUB, COL.SELL_HRS, COL.SELL].forEach(c=>{
+        sh.getRange(row, startCol + (c - COL.TRADE), data.length, 1)
+          .setNumberFormat('$#,##0.00').setHorizontalAlignment('right');
+      });
+      sh.getRange(row, startCol + (COL.DESC - COL.TRADE), data.length, 1).setWrap(true);
+      sh.getRange(row,2,data.length,hdr.length).applyRowBanding(SpreadsheetApp.BandingTheme.LIGHT_GREY);
+
+      const startData = row;
+      row += data.length;
+
+      // Subtotals block
+      mergeSafeSet(sh.getRange(row,2,1,2),'Subtotals').setFontWeight('bold')
+        .setBackground(COLORS.SUB).setBorder(true,true,true,true,true,true);
+
+      const lbrCol = startCol + (COL.LBR_HRS - COL.TRADE);
+      sh.getRange(row, lbrCol)
+        .setFormula(`=SUM(${a1(startData,lbrCol)}:${a1(row-1,lbrCol)})`)
+        .setNumberFormat('0.0').setHorizontalAlignment('right');
+
+      // currency subtotals & remember SELL and COST cells
+      const costCol = startCol + (COL.COST - COL.TRADE);
+      const sellCol = startCol + (COL.SELL - COL.TRADE);
+
+      [COL.MAT_COST, COL.SUBS_COST, COL.COST, COL.RATE,
+       COL.SELL_MAT, COL.SELL_SUB, COL.SELL_HRS, COL.SELL].forEach(c=>{
+        const colIdx = startCol + (c - COL.TRADE);
+        sh.getRange(row, colIdx)
+          .setFormula(`=SUM(${a1(startData,colIdx)}:${a1(row-1,colIdx)})`)
+          .setNumberFormat('$#,##0.00').setHorizontalAlignment('right');
+      });
+
+      // keep references so we can sum project-wide
+      totalCostCells.push(a1(row, costCol));
+      totalSellCells.push(a1(row, sellCol));
+
+      sh.getRange(row, 16).setValue('Margin').setFontWeight('bold');
+      sh.getRange(row, 17)
+        .setFormula(`=IF(${a1(row,sellCol)}>0,(${a1(row,sellCol)}-${a1(row,costCol)})/${a1(row,sellCol)},"")`)
+        .setNumberFormat('0.0%');
+
+      row += 2;
     }
   });
 
-  // finalize tasks
-  Object.values(tasks).forEach(t => {
-    t.cost     = t.labour.cost + t.material.cost + t.other.cost;
-    t.price    = t.labour.price + t.material.price + t.other.price;
-    t.discount = t.labour.discount + t.material.discount + t.other.discount;
-    computePMM(t);
-    computePMM(t.labour);
-    computePMM(t.material);
+  // 4) Write the mini-summary under the title (B2:C7)
+  const sellFormula = totalSellCells.length ? '=' + totalSellCells.join('+') : '=0';
+  const costFormula = totalCostCells.length ? '=' + totalCostCells.join('+') : '=0';
+  sh.getRange('B2').setValue('Project Name').setFontWeight('bold');
+  sh.getRange('C2').setValue(projectName);
+
+  sh.getRange('B3').setValue('Opportunity ID').setFontWeight('bold');
+  sh.getRange('C3').setValue(opportunityId);
+
+  sh.getRange('B4').setValue('Project Budget').setFontWeight('bold');
+  sh.getRange('C4').setFormula(costFormula).setNumberFormat('$#,##0.00');
+
+  sh.getRange('B5').setValue('Project Selling Price').setFontWeight('bold');
+  sh.getRange('C5').setFormula(sellFormula).setNumberFormat('$#,##0.00');
+
+  sh.getRange('B6').setValue('Markup').setFontWeight('bold');
+  sh.getRange('C6').setFormula('=IF(C4>0,(C5-C4)/C4,"")').setNumberFormat('0.0%');
+
+  sh.getRange('B7').setValue('Margin').setFontWeight('bold');
+  sh.getRange('C7').setFormula('=IF(C5>0,(C5-C4)/C5,"")').setNumberFormat('0.0%');
+
+  // 5) Grand total (kept) next to header card
+  sh.getRange('F3').setFormula(totalSellCells.length ? '=' + totalSellCells.join('+') : '=0')
+    .setNumberFormat('$#,##0.00').setFontSize(12).setFontWeight('bold')
+    .setBorder(true,true,true,true,true,true);
+
+  // 6) Footer: Notes & Exclusions (kept)
+  const agg = aggregateAllNotesExUnique();
+  mergeSafeSet(sh.getRange(row,2,1,17),'Notes & Exclusions (All divisions, unique + defaults)')
+    .setFontWeight('bold').setBackground('#EFEFEF').setBorder(true,true,true,true,true,true);
+  row += 2;
+
+  mergeSafeSet(sh.getRange(row,2,1,2),'Notes').setFontWeight('bold'); row++;
+  row = writeMergedList(sh, row, agg.notes.length ? agg.notes : DEFAULT_NOTES); row++;
+
+  mergeSafeSet(sh.getRange(row,2,1,2),'Warranty').setFontWeight('bold'); row++;
+  row = writeMergedList(sh, row, agg.warranty.length ? agg.warranty : ['—']); row++;
+
+  mergeSafeSet(sh.getRange(row,2,1,2),'Exclusions').setFontWeight('bold'); row++;
+  const excLines = (agg.exc.length ? agg.exc : DEFAULT_EXCLUSIONS).map(sentenceCase_);
+  row = writeMergedList(sh, row, excLines);
+}
+
+
+
+/** Scope builder */
+function Build_Scope(){
+  const sc = SpreadsheetApp.getActive().getSheetByName(S_SCOPE);
+  const blocks = DIVS.map((div, idx) => {
+    const sh  = SpreadsheetApp.getActive().getSheetByName(div.sheet);
+    if (!sh) return '';
+    const lines = readStoryRows(sh);
+    if (!lines.length) return '';
+    const secNum = (idx+1).toFixed(2).replace('.00','');
+    const head = `${secNum}.00 ${div.name}`;
+    const body = lines.map((t,i)=> `${secNum}.${String(i+1).padStart(2,'0')} ${t}`).join('\n');
+    return head + '\n' + body;
+  }).filter(Boolean);
+  sc.clear({contentsOnly:true});
+  sc.getRange(1,1).setValue(blocks.join('\n\n'));
+}
+
+/** Aggregate notes unique across divisions */
+function aggregateAllNotesExUnique(){
+  const uniqNotes = new Set(), uniqExc = new Set(), uniqWar = new Set();
+
+  DIVS.forEach(div => {
+    const sh = SpreadsheetApp.getActive().getSheetByName(div.sheet);
+    if (!sh) return;
+    const L  = layout(div);
+    const headerRow = L.nweTop + 1;
+
+    const notes = sh.getRange(headerRow+1, 2, NWE_ROWS, 6).getValues().flat().map(x=>String(x||'').trim()).filter(Boolean);
+    const wars  = sh.getRange(headerRow+1, 9, NWE_ROWS, 6).getValues().flat().map(x=>String(x||'').trim()).filter(Boolean);
+    const excs  = sh.getRange(headerRow+1,16, NWE_ROWS, 3).getValues().flat().map(x=>String(x||'').trim()).filter(Boolean);
+
+    notes.forEach(t => uniqNotes.add(t));
+    wars.forEach(t  => uniqWar.add(t));
+    excs.forEach(t  => uniqExc.add(t));
   });
 
-  // finalize divisions
-  Object.values(divisions).forEach(d => computePMM(d));
-
-  // global totals
-  const global = Object.values(divisions).reduce((acc, d) => {
-    acc.cost     += d.cost;
-    acc.price    += d.price;
-    acc.discount += d.discount;
-    return acc;
-  }, { cost: 0, price: 0, discount: 0 });
-  computePMM(global);
-
-  const header = { quoteNumber: SET.quoteNumber, createdAt: formatDate(new Date()) };
-  return { header, tasks, divisions, exclusions, quality, global };
+  return { notes:[...uniqNotes], exc:[...uniqExc], warranty:[...uniqWar] };
 }
 
-/* ---------------- labour rate helpers (still used for division summaries) ---------------- */
-
-function summarizeDivisionLabourRate(d) {
-  const cost = pickMode(d.labourCostRates);
-  const sell = pickMode(d.labourSellRates);
-  const label = `$${n(cost.mode)} / $${n(sell.mode)}`;
-  return { label, cost, sell };
+/** Seeds for source sheets */
+function seedSourceSheets(){
+  const tasks = SpreadsheetApp.getActive().getSheetByName(S_SRC_TASKS);
+  const rev   = SpreadsheetApp.getActive().getSheetByName(S_SRC_REV);
+  const cost  = SpreadsheetApp.getActive().getSheetByName(S_SRC_COST);
+  if (tasks.getLastRow() < 1) tasks.getRange(1,1,1,6).setValues([['PROJECT TASK','DESCRIPTION','TYPE','Planned Start Date','PLANNED END DATE','TAX CATEGORY']]).setFontWeight('bold');
+  if (rev.getLastRow()   < 1) rev.getRange(1,1,1,6).setValues([['PROJECT TASK','COST ACCOUNT GROUP','COST CODE','DESCRIPTION','UOM','UNIT PRICE']]).setFontWeight('bold');
+  if (cost.getLastRow()  < 1) cost.getRange(1,1,1,5).setValues([['PROJECT TASK','COST ACCOUNT GROUP','COST CODE','UOM','UNIT COST']]).setFontWeight('bold');
 }
 
-function buildLabourRateDetails(modeCost, modeSell, divTasks) {
+/** Rebuild Template Plumbing from sources with overrides (kept) */
+function Rebuild_Plumbing_Template_From_Sources(){
+  const out = SpreadsheetApp.getActive().getSheetByName(S_TPL_P);
+  out.clear({contentsOnly:true});
+  const header = ['Project Task','Cost Code','Account Group','Description','UOM','Sell Rate $/Hr','Cost Rate $/Hr','Type','Tax Category','Default Planned Start','Default Planned End'];
+  out.getRange(1,1,1,header.length).setValues([header]).setFontWeight('bold');
+
+  const shtTasks = SpreadsheetApp.getActive().getSheetByName(S_SRC_TASKS);
+  const shtRev   = SpreadsheetApp.getActive().getSheetByName(S_SRC_REV);
+  const shtCost  = SpreadsheetApp.getActive().getSheetByName(S_SRC_COST);
+
+  // Defaults from Settings
+  const set = SpreadsheetApp.getActive().getSheetByName(S_SET);
+  const costDefault = Number(set.getRange('B3').getValue()||85);
+  const sellDefault = Number(set.getRange('B4').getValue()||140);
+
+  const COST_OVERRIDES = { 'PSUPERVISI': 93 };
+
+  const taskMap = {};
+  const tVals = shtTasks.getRange(2,1,Math.max(shtTasks.getLastRow()-1,0),6).getValues();
+  tVals.forEach(r=>{
+    const t = String(r[0]||'').trim(); if (!t) return;
+    taskMap[t] = { desc:String(r[1]||'').trim(), type:String(r[2]||'').trim(), start:r[3]||'', end:r[4]||'', tax:String(r[5]||'').trim() };
+  });
+
+  // Revenue R
+  const revMap = {};
+  const rVals = shtRev.getRange(2,1,Math.max(shtRev.getLastRow()-1,0),6).getValues();
+  rVals.forEach(r=>{
+    const task = String(r[0]||'').trim();
+    const ag   = String(r[1]||'').toUpperCase();
+    if (!task) return;
+    if (ag === 'R'){
+      revMap[task] = { sellRate:Number(r[5])||'', uom:String(r[4]||'').trim()||'HOUR', costCode:String(r[2]||'').trim() };
+    }
+  });
+
+  // Cost L
   const costMap = {};
-  const sellMap = {};
+  const cVals = shtCost.getRange(2,1,Math.max(shtCost.getLastRow()-1,0),5).getValues();
+  cVals.forEach(r=>{
+    const task = String(r[0]||'').trim();
+    const ag   = String(r[1]||'').toUpperCase();
+    if (!task) return;
+    if (ag === 'L') costMap[task] = { costRate:Number(r[4])||'' };
+  });
 
-  divTasks.forEach(t => {
-    const hrs = Number(t.labour.qty || 0);
-    if (!hrs) return;
+  const keys = new Set(Object.keys(taskMap).concat(Object.keys(revMap)).concat(Object.keys(costMap)));
+  let row = 2;
+  keys.forEach(k=>{
+    const meta = taskMap[k] || {};
+    const rev  = revMap[k]   || {};
+    const cst  = costMap[k]  || {};
+    const costRate = (Object.prototype.hasOwnProperty.call(COST_OVERRIDES,k) ? COST_OVERRIDES[k] : (cst.costRate || costDefault));
+    const sellRate = rev.sellRate || sellDefault;
 
-    const c = round2(t.labour.cost / hrs);
-    const s = round2(t.labour.price / hrs);
+    const outRow = [
+      k,
+      rev.costCode || '',
+      'R',
+      meta.desc || '',
+      rev.uom || 'HOUR',
+      sellRate,
+      costRate,
+      meta.type || '',
+      meta.tax || '',
+      meta.start || '',
+      meta.end || ''
+    ];
+    out.getRange(row,1,1,outRow.length).setValues([outRow]);
+    row++;
+  });
 
-    if (c && Math.abs(c - modeCost) > 0.009) {
-      if (!costMap[c]) costMap[c] = [];
-      costMap[c].push({ desc: t.description || t.task || '', hrs });
+  applyTaskValidationAll();
+  ensureMirrorListAll_();
+  logMsg('Template Plumbing rebuilt from sources count ' + keys.size);
+}
+
+/** Catalog and Library seeds */
+function seedCatalog(){
+  const sh = SpreadsheetApp.getActive().getSheetByName(S_CAT);
+  sh.clear({contentsOnly:true});
+  const hdr = ['SectionKey','Group','Trade','Description','LbrHrs','MatCost','SubsCost','Task','CostCode','AcctGroup','UOM'];
+  sh.getRange(1,1,1,hdr.length).setValues([hdr]).setFontWeight('bold');
+  const rows = [
+    ['PM','PM','MBC','Pre admin & kick off',10,0,0,'PMGMT','','L','HOUR'],
+    ['PM','PM','MBC','Close out',8,0,0,'PMGMT','','L','HOUR'],
+    ['PM','PM','MBC','Project mileage',0,550,0,'PMGMT','','MQ','EACH'],
+    ['CON','Flooring Demo','MBC','Carpet demo and disposal',720,0,0,'FLOOR','','L','HOUR'],
+    ['CON','Flooring Demo','MBC','Concrete demo and disposal',70,0,0,'FLOOR','','L','HOUR'],
+    ['ELE','Electrical Demo','Sub Electrical','Remove lights on false ceilings',4,0,0,'ELEC','','L','HOUR'],
+    ['MEC','Mechanical Demo','Sub Mechanical','Remove redundant wiring in walls',0.4,0,0,'MECH','','L','HOUR'],
+    ['PLU','Plumbing Demo','', 'Plumbing demo',0,0,0,'PDEMO','22-0505','L','HOUR'],
+    ['PLU','Domestic water','', 'Domestic water',0,0,0,'PDOWATER','22-1116','MQ','EACH']
+  ];
+  sh.getRange(2,1,rows.length,rows[0].length).setValues(rows);
+}
+function seedNotesLibrary(){
+  const sh = SpreadsheetApp.getActive().getSheetByName(S_LIB);
+  sh.clear({contentsOnly:true});
+  sh.getRange(1,1,1,3).setValues([['Category','Code','Text']]).setFontWeight('bold');
+  const rows = [
+    ['Note','N001','Client to provide free and clear work area.'],
+    ['Note','N002','All work during regular hours unless otherwise noted.'],
+    ['Note','N003','Existing conditions to be verified on site.'],
+    ['Warranty','W001','Standard one-year workmanship warranty unless noted otherwise.'],
+    ['Exclusion','E001','engineering, drawings, and permits.'],
+    ['Exclusion','E002','weekends work or holiday work.'],
+    ['Exclusion','E003','Firestopping by others unless explicitly included.']
+  ];
+  sh.getRange(2,1,rows.length,rows[0].length).setValues(rows);
+}
+
+/** Empty template shell for Construction (kept generic) */
+function seedEmptyTemplateSheet(name){
+  const sh = SpreadsheetApp.getActive().getSheetByName(name);
+  sh.clear({contentsOnly:true});
+  sh.getRange(1,1,1,11).setValues([[
+    'Project Task','Cost Code','Account Group','Description','UOM',
+    'Sell Rate $/Hr','Cost Rate $/Hr','Type','Tax Category','Default Planned Start','Default Planned End'
+  ]]).setFontWeight('bold');
+}
+
+/** Template Plumbing with all tasks (unchanged) */
+function seedPlumbingTemplate(){
+  const sh = SpreadsheetApp.getActive().getSheetByName(S_TPL_P);
+  sh.clear({contentsOnly:true});
+  sh.getRange(1,1,1,11).setValues([[
+    'Project Task','Cost Code','Account Group','Description','UOM',
+    'Sell Rate $/Hr','Cost Rate $/Hr','Type','Tax Category','Default Planned Start','Default Planned End'
+  ]]).setFontWeight('bold');
+
+  const DFLT_COST = 85;
+  const COST_OVERRIDES = { 'PSUPERVISI': 93 };
+
+  // [Task, Cost Code, Sell, Description]
+  const items = [
+    ['PDEMO','22-0505',130,'Plumbing demo'],
+    ['PDOWATER','22-1116',130,'Domestic water'],
+    ['PFIXTURES','22-4200',130,'Plumbing fixtures'],
+    ['PGCSUPER','22-0000',140,'GC Plumbing Project supervision'],
+    ['PGENERAL','22-0000',130,'Plumbing General'],
+    ['PPIPEINSU','22-0719',130,'Pipe insulation'],
+    ['PRENTALE','01-6030',130,'Rental equipment'],
+    ['PROOFING','07-6100',130,'Roofing'],
+    ['PSANPAG','22-1318',130,'San Piping - above grade'],
+    ['PSANPBG','22-1317',130,'San Piping - below grade'],
+    ['PSUPERVISI','22-0000',140,'Plumbing Project supervision'],
+    ['PVENTPIP','22-1318',130,'Vent Piping']
+  ];
+
+  const rows = items.map(([task, code, sell, desc])=>[
+    task,
+    code,
+    'R',
+    desc,
+    'HOUR',
+    sell,
+    (task in COST_OVERRIDES) ? COST_OVERRIDES[task] : DFLT_COST,
+    'Cost and Revenue Task',
+    'H',
+    '',
+    ''
+  ]);
+
+  sh.getRange(2,1,rows.length,rows[0].length).setValues(rows);
+}
+
+/** Template HVAC from your table */
+function seedHVACTemplate(){
+  const sh = SpreadsheetApp.getActive().getSheetByName(S_TPL_H);
+  sh.clear({contentsOnly:true});
+  sh.getRange(1,1,1,11).setValues([[
+    'Project Task','Cost Code','Account Group','Description','UOM',
+    'Sell Rate $/Hr','Cost Rate $/Hr','Type','Tax Category','Default Planned Start','Default Planned End'
+  ]]).setFontWeight('bold');
+
+  const rows = [
+    ['HDIFREG',  '23-3713','R','Diffuser, Grillers, Registers','HOUR',140,93,'Cost and Revenue Task','H','',''],
+    ['HGCSUPER', '23-0000','R','GC HVAC Supervision','HOUR',140,93,'Cost and Revenue Task','H','',''],
+    ['HROOFING', '07-6100','R','Roofing','HOUR',140,93,'Cost and Revenue Task','H','',''],
+    ['HSUPERVISI','23-0000','R','HVAC Supervision','HOUR',140,93,'Cost and Revenue Task','H','',''],
+    ['HVACDEMO','23-0505','R','HVAC Demo','HOUR',140,93,'Cost and Revenue Task','H','',''],
+    ['HVACDUCT','23-3113','R','HVAC Duct','HOUR',140,93,'Cost and Revenue Task','H','',''],
+    ['HVACEQUIP','23-3400','R','HVAC Equipment','HOUR',140,93,'Cost and Revenue Task','H','',''],
+    ['HVACGRAL','23-0000','R','HVAC General','HOUR',140,93,'Cost and Revenue Task','H','',''],
+    ['HVACINSU','23-0700','R','HVAC Insulation','HOUR',140,93,'Cost and Revenue Task','H','',''],
+    ['HVACPIPI','23-1100','R','HVAC Piping','HOUR',140,93,'Cost and Revenue Task','H','',''],
+    ['HVACTAB', '23-0593','R','HVAC Testing, adjusting, balancing','HOUR',140,93,'Cost and Revenue Task','H','','']
+  ];
+  sh.getRange(2,1,rows.length,rows[0].length).setValues(rows);
+}
+
+/** Template Electrical from your tables (sell + cost) */
+function seedElectricalTemplate(){
+  const sh = SpreadsheetApp.getActive().getSheetByName(S_TPL_E);
+  sh.clear({contentsOnly:true});
+  sh.getRange(1,1,1,11).setValues([[
+    'Project Task','Cost Code','Account Group','Description','UOM',
+    'Sell Rate $/Hr','Cost Rate $/Hr','Type','Tax Category','Default Planned Start','Default Planned End'
+  ]]).setFontWeight('bold');
+
+  // selling table
+  const sellRows = [
+    ['ECIRCUITRI','26-0533','Power/Branch Circuit Rough-in',130],
+    ['EDATACOMF','27-0529','Data/Communications Finishes',130],
+    ['EDATACOMRI','27-0528','Data/Communications Rough In',130],
+    ['EDEMOLITIO','26-0505','Electrical demolition',130],
+    ['EDISTRIBU','26-2401','Distribution Installs',130],
+    ['EFIREALARM','28-4600','Fire Alarm Rough-In',130],
+    ['EGCSUPERVI','26-0000','GCSupervision',140],
+    ['ELIGHTINGF','26-5119','Lighting finishes',130],
+    ['ELIGHTINRI','26-5000','Lighting rough-in',130],
+    ['ERENTALS','01-6030','Equipment Rental',130],
+    ['ESAINSP','26-0000','ESA Inspection',130],
+    ['ESDTIN','26-2402','Shutdown/ Tie In',130],
+    ['ESUPERVISI','26-0000','Electrical Supervision',140]
+  ];
+
+  // cost table (task -> cost rate)
+  const costMap = {
+    'EGCSUPERVI':93, 'ESUPERVISI':93,
+    'ECIRCUITRI':85,'EDATACOMF':85,'EDATACOMRI':85,'EDEMOLITIO':85,'EDISTRIBU':85,
+    'EFIREALARM':85,'ELIGHTINGF':85,'ELIGHTINRI':85,'ESDTIN':85
+  };
+
+  const rows = sellRows.map(([task, code, desc, sell])=>[
+    task, code, 'R', desc, 'HOUR', sell, (costMap[task] ?? 85), 'Cost and Revenue Task','H','',''
+  ]);
+  sh.getRange(2,1,rows.length,rows[0].length).setValues(rows);
+}
+
+/** UI helpers */
+function UI_AddFromCatalog_Here(){
+  const sh = SpreadsheetApp.getActiveSheet();
+  const div = DIVS.find(d => d.sheet === sh.getName());
+  if (!div) { SpreadsheetApp.getUi().alert('Open a pricing division sheet first.'); return; }
+
+  const ui = SpreadsheetApp.getUi();
+  const filt = ui.prompt('Find text', 'Type part of a description or leave blank', ui.ButtonSet.OK_CANCEL);
+  if (filt.getSelectedButton() !== ui.Button.OK) return;
+  const needle = (filt.getResponseText()||'').toLowerCase();
+
+  const cat = SpreadsheetApp.getActive().getSheetByName(S_CAT);
+  const data = cat.getRange(2,1, Math.max(cat.getLastRow()-1,0), 11).getValues();
+  const pick = data.filter(r => r[0] === div.key && (needle === '' || String(r[3]).toLowerCase().includes(needle)));
+  if (!pick.length) { ui.alert('No matches.'); return; }
+
+  const list = pick.map((r,i)=>`${i+1}. ${r[3]}  [${r[7]}]`).join('\n');
+  const sel = ui.prompt('Select numbers', 'Enter numbers separated by commas. Task codes shown in brackets.\n\n' + list, ui.ButtonSet.OK_CANCEL);
+  if (sel.getSelectedButton() !== ui.Button.OK) return;
+  const nums = sel.getResponseText().split(',').map(s=>parseInt(s.trim(),10)).filter(n=>!isNaN(n) && n>=1 && n<=pick.length);
+  if (!nums.length) return;
+
+  const rows = nums.map(n => pick[n-1]);
+  addRowsHere(div, rows);
+}
+
+function UI_Add_Blank_(div){
+  const tplName = getTemplateSheetForDivision_(div);
+  if (!tplName){ SpreadsheetApp.getUi().alert('No template defined for this division yet.'); return; }
+  const tpl = SpreadsheetApp.getActive().getSheetByName(tplName);
+  const last = tpl.getLastRow();
+  const tasks = (last>=2) ? tpl.getRange(2,1,last-1,1).getValues().map(r=>String(r[0]||'').trim()).filter(Boolean) : [];
+  if (!tasks.length){ SpreadsheetApp.getUi().alert('Template for this division is empty. Load or rebuild it first.'); return; }
+
+  const ui = SpreadsheetApp.getUi();
+  const t = ui.prompt('New line', 'Type a Task ID such as PDEMO', ui.ButtonSet.OK_CANCEL);
+  if (t.getSelectedButton() !== ui.Button.OK) return;
+  const task = String(t.getResponseText()||'').trim();
+  if (!tasks.includes(task)){ ui.alert('Task "'+task+'" was not found in the template for this division.'); return; }
+
+  // find template row to pull defaults
+  const row = tpl.createTextFinder('^'+task+'$').useRegularExpression(true).matchEntireCell(true).findNext();
+  let desc='', code='', uom='HOUR', sellRate='', acct='R', costRate='';
+  if (row){
+    const r = row.getRow();
+    const vals = tpl.getRange(r,1,1,11).getValues()[0];
+    desc     = vals[3] || '';
+    code     = vals[1] || '';
+    acct     = vals[2] || 'R';
+    uom      = vals[4] || 'HOUR';
+    sellRate = vals[5] || '';
+    costRate = vals[6] || '';
+  }
+
+  addRowsHere(div, [[div.key, '', '', desc||'New line', 0, 0, 0, task, code, acct, uom, sellRate, costRate]]);
+}
+function UI_AddBlank_Here(){
+  const sh = SpreadsheetApp.getActiveSheet();
+  const div = DIVS.find(d => d.sheet === sh.getName());
+  if (!div) { SpreadsheetApp.getUi().alert('Open a pricing division sheet first.'); return; }
+  UI_Add_Blank_(div);
+}
+
+/** Add rows helper (from Catalog/UI adds) */
+function addRowsHere(div, rows){
+  const sh = SpreadsheetApp.getActive().getSheetByName(div.sheet);
+  const L = layout(div);
+  const start = L.data, lastDataRow = L.data + div.lines - 1;
+
+  for (let k=0; k<rows.length; k++){
+    let place = -1;
+    for (let r = start; r <= lastDataRow; r++) {
+      const val = sh.getRange(r, COL.DESC).getValue();
+      if (!String(val).trim()) { place = r; break; }
     }
-    if (s && Math.abs(s - modeSell) > 0.009) {
-      if (!sellMap[s]) sellMap[s] = [];
-      sellMap[s].push({ desc: t.description || t.task || '', hrs });
+    if (place === -1) { SpreadsheetApp.getUi().alert('No free rows left in ' + div.name); return; }
+
+    // Accept optional sell/cost rates at the end of the array if provided
+    const [sectionKey, group, trade, desc, lhrs, mat, subs, task, ccode, acct, uom, sellRateOpt, costRateOpt] = rows[k];
+    sh.getRange(place, COL.INC).setValue(true);
+    sh.getRange(place, COL.TRADE).setValue(trade || '');
+    sh.getRange(place, COL.PICK).setValue(task || '');     // Item shows Task ID
+    sh.getRange(place, COL.TASK).setValue(task || '');     // hidden Task ID
+    sh.getRange(place, COL.DESC).setValue(desc || '');
+    sh.getRange(place, COL.LBR_HRS).setValue(Number(lhrs) || 0);
+    sh.getRange(place, COL.MAT_COST).setValue(Number(mat) || 0);
+    sh.getRange(place, COL.SUBS_COST).setValue(Number(subs) || 0);
+    if (!sh.getRange(place, COL.MK).getValue())   sh.getRange(place, COL.MK).setFormulaR1C1('=Settings!R5C2');
+    if (!sh.getRange(place, COL.RATE).getValue()) sh.getRange(place, COL.RATE).setFormulaR1C1('=Settings!R4C2');
+    if (sellRateOpt !== undefined && sellRateOpt !== '') sh.getRange(place, COL.RATE).setValue(Number(sellRateOpt)||0);
+    if (costRateOpt !== undefined && costRateOpt !== '') sh.getRange(place, COL.COST_RATE_HR).setValue(Number(costRateOpt)||0);
+    sh.getRange(place, COL.SECTION).setValue(sectionKey || div.key);
+    sh.getRange(place, COL.GROUP).setValue(group || '');
+    sh.getRange(place, COL.COST_CODE).setValue(ccode || '');
+    sh.getRange(place, COL.ACCT_GRP).setValue(String(acct||'').toUpperCase());
+    sh.getRange(place, COL.UOM).setValue(uom || 'HOUR');
+  }
+}
+
+/** Library pickers */
+function UI_Pick_NotesEx(){
+  const sh = SpreadsheetApp.getActiveSheet();
+  const div = DIVS.find(d => d.sheet === sh.getName());
+  if (!div) { SpreadsheetApp.getUi().alert('Open a division sheet to insert Notes Warranty Exclusions.'); return; }
+
+  const lib = SpreadsheetApp.getActive().getSheetByName(S_LIB);
+  const data = lib.getRange(2,1, Math.max(lib.getLastRow()-1,0), 3).getValues();
+  if (!data.length) { SpreadsheetApp.getUi().alert('Notes Library is empty.'); return; }
+
+  const list = data.map((r,i)=>`${i+1}. [${r[0]}] ${r[2]}  (${r[1]})`).join('\n');
+  const ui = SpreadsheetApp.getUi();
+  const sel = ui.prompt('Select numbers', 'Enter numbers separated by commas\n\n' + list, ui.ButtonSet.OK_CANCEL);
+  if (sel.getSelectedButton() !== ui.Button.OK) return;
+  const nums = sel.getResponseText().split(',').map(s=>parseInt(s.trim(),10)).filter(n=>!isNaN(n) && n>=1 && n<=data.length);
+  if (!nums.length) return;
+
+  const L = layout(div);
+  const headerRow = L.nweTop + 1;
+
+  const blocks = {
+    'Note':     {row: headerRow+1, col: 2,  w:6},
+    'Warranty': {row: headerRow+1, col: 9,  w:6},
+    'Exclusion':{row: headerRow+1, col: 16, w:3}
+  };
+  Object.keys(blocks).forEach(k=>{
+    const b = blocks[k];
+    while (b.row < headerRow+1+NWE_ROWS && sh.getRange(b.row, b.col, 1, b.w).getDisplayValue().trim()) b.row++;
+  });
+
+  nums.forEach(n => {
+    const cat = String(data[n-1][0]).trim();
+    const text = String(data[n-1][2]).trim();
+    const b = blocks[cat] || blocks['Note'];
+    if (b.row < headerRow+1+NWE_ROWS){
+      sh.getRange(b.row, b.col, 1, b.w).setValue(text);
+      b.row++;
     }
   });
+}
+function UI_Add_FreeText_NE_Here(){
+  const sh = SpreadsheetApp.getActiveSheet();
+  const div = DIVS.find(d => d.sheet === sh.getName());
+  if (!div) { SpreadsheetApp.getUi().alert('Open a division sheet to insert Notes Warranty Exclusions.'); return; }
+
+  const ui = SpreadsheetApp.getUi();
+  const cat = ui.prompt('Category', 'Type Note or Exclusion or Warranty', ui.ButtonSet.OK_CANCEL);
+  if (cat.getSelectedButton() !== ui.Button.OK) return;
+  const c = String(cat.getResponseText()).trim().toLowerCase();
+  if (!['note','exclusion','warranty'].includes(c)) { SpreadsheetApp.getUi().alert('Use Note or Exclusion or Warranty'); return; }
+  const t = ui.prompt('Text', 'Type the line', ui.ButtonSet.OK_CANCEL);
+  if (t.getSelectedButton() !== ui.Button.OK) return;
+
+  const L = layout(div);
+  const headerRow = L.nweTop + 1;
+  const block = (c==='warranty') ? {col:9,w:6} : (c==='exclusion') ? {col:16,w:3} : {col:2,w:6};
+  let r = headerRow+1;
+  while (r < headerRow+1+NWE_ROWS && sh.getRange(r, block.col, 1, block.w).getDisplayValue().trim()) r++;
+  if (r < headerRow+1+NWE_ROWS) sh.getRange(r, block.col, 1, block.w).setValue(t.getResponseText());
+}
+
+/** Template indexes */
+function readTplIndex_AllDivs(){
+  const out = {};
+  [S_TPL_P, S_TPL_E, S_TPL_C, S_TPL_H].forEach(name=>{
+    const tpl = SpreadsheetApp.getActive().getSheetByName(name);
+    if (!tpl) return;
+    const last = tpl.getLastRow();
+    if (last < 2) return;
+    const vals = tpl.getRange(2,1,last-1,11).getValues(); // A..K
+    vals.forEach(r=>{
+      const task = String(r[0]||'').trim(); if (!task) return;
+      out[task] = {
+        task,
+        costCode: String(r[1]||'').trim(),
+        acct:     String(r[2]||'').trim(),
+        desc:     String(r[3]||'').trim(),
+        uom:      String(r[4]||'').trim(),
+        sellRate: Number(r[5])||0,
+        costRate: Number(r[6])||0,
+        type:     String(r[7]||'').trim(),
+        tax:      String(r[8]||'').trim(),
+        start:    r[9] || '',
+        end:      r[10]|| ''
+      };
+    });
+  });
+  return out;
+}
+
+function readTplIndexByDesc_(div){ // by Description for the division template
+  const tplName = getTemplateSheetForDivision_(div);
+  const tpl = SpreadsheetApp.getActive().getSheetByName(tplName);
+  if (!tpl) return {};
+  const last = tpl.getLastRow();
+  const idx = {};
+  if (last >= 2){
+    const vals = tpl.getRange(2,1,last-1,11).getValues();
+    vals.forEach(r=>{
+      const task = String(r[0]||'').trim();
+      const desc = String(r[3]||'').trim();
+      if (!desc) return;
+      idx[desc] = {
+        task,
+        costCode: String(r[1]||'').trim(),
+        acct:     String(r[2]||'').trim(),
+        desc,
+        uom:      String(r[4]||'').trim(),
+        sellRate: Number(r[5])||0,
+        costRate: Number(r[6])||0
+      };
+    });
+  }
+  return idx;
+}
+
+/** Lines used across all divisions */
+function gatherUsedLines(){
+  const used = [];
+  DIVS.forEach(div=>{
+    const sh = SpreadsheetApp.getActive().getSheetByName(div.sheet);
+    if (!sh) return;
+    const L = layout(div);
+    const vals = sh.getRange(L.data, 1, div.lines, COL.COST_RATE_HR).getValues(); // pull through to W
+    for (let i=0;i<vals.length;i++){
+      const r = vals[i];
+      const inc  = r[COL.INC-1] !== false;
+      const desc = String(r[COL.DESC-1]||'').trim();
+      const lhrs = Number(r[COL.LBR_HRS-1])||0;
+      const mat  = Number(r[COL.MAT_COST-1])||0;
+      const subs = Number(r[COL.SUBS_COST-1])||0;
+      const sell = Number(r[COL.SELL-1])||0;
+      if (!inc || (!desc && sell<=0 && lhrs<=0 && mat<=0 && subs<=0)) continue;
+      used.push({div, row:L.data+i, sh});
+    }
+  });
+  return used;
+}
+
+/** Build CSV strings and download them */
+function buildProjectTasksCSV_(){
+  const idx   = readTplIndex_AllDivs();                  // task -> meta from ALL templates
+  const used  = gatherUsedLines();                       // rows that are "included"
+
+  const todayStr = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd');
+
+  // Keep ONLY tasks from rows where Selling > 0
+  const tasks = new Map();
+  used.forEach(u=>{
+    const selling = Number(u.sh.getRange(u.row, COL.SELL).getValue() || 0);
+    if (selling <= 0) return;                           // hard guard
+    const task = String(u.sh.getRange(u.row, COL.TASK).getValue()||'').trim();
+    if (!task) return;
+    tasks.set(task, true);
+  });
+
+  // Proper header casing
+  const header = ['Project Task','Description','Type','Planned Start Date','Planned End Date','Tax Category'];
+  const rows = [header];
+
+  tasks.forEach((_, task)=>{
+    const meta = idx[task] || {};
+    rows.push([
+      task,
+      meta.desc || '',
+      meta.type || '',
+      todayStr,
+      todayStr,
+      meta.tax || ''
+    ]);
+  });
+
+  const csv = rows.map(r=>r.map(v=>String(v).replace(/"/g,'""')).map(v=>`"${v}"`).join(',')).join('\n');
+  const name = 'Project_Tasks_'+Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyyMMdd_HHmmss')+'.csv';
+  return { name, csv };
+}
+
+
+function asTextCode_(code){
+  const s = String(code||'').trim();
+  if (!s) return '';
+  // Force spreadsheet apps to keep it as text (not date) on import
+  return `="${s}"`;
+}
+
+function roundTo_(value, decimals){
+  const num = Number(value);
+  if (!Number.isFinite(num)) return 0;
+  const factor = Math.pow(10, decimals);
+  return Math.round((num + Number.EPSILON) * factor) / factor;
+}
+
+function buildEstimationCSV_(){
+  const idx = readTplIndex_AllDivs();
+  const set = SpreadsheetApp.getActive().getSheetByName(S_SET);
+  const costHrDefault = Number(set.getRange('B3').getValue()||0);
 
   const lines = [];
-  const fmtList = arr => arr.map(x => `${x.desc} ${n(x.hrs)} hrs`).join(', ');
+  // Title-cased headers per your requirement
+  const header = ['Project Task','Cost Code','Cost Account Group','Description','UOM','Quantity','Unit Cost','Unit Price'];
+  lines.push(header);
 
-  const costRates = Object.keys(costMap).map(Number).sort((a,b)=>a-b);
-  const sellRates = Object.keys(sellMap).map(Number).sort((a,b)=>a-b);
+  DIVS.forEach(div=>{
+    const sh = SpreadsheetApp.getActive().getSheetByName(div.sheet);
+    if (!sh) return;
+    const L  = layout(div);
+    const vals = sh.getRange(L.data, 1, div.lines, COL.COST_RATE_HR).getValues();
 
-  if (costRates.length || sellRates.length) {
-    lines.push('Labour rate details:');
-    costRates.forEach(r => lines.push(`Cost ${n(r)} on ${fmtList(costMap[r])}.`));
-    sellRates.forEach(r => lines.push(`Sell ${n(r)} on ${fmtList(sellMap[r])}.`));
+    for (let i=0;i<vals.length;i++){
+      const r = vals[i];
+      const inc  = r[COL.INC-1] !== false; if (!inc) continue;
+      const desc = String(r[COL.DESC-1]||'').trim(); if (!desc) continue;
+
+      const lhrs = Number(r[COL.LBR_HRS-1])||0;
+      const mat  = Number(r[COL.MAT_COST-1])||0;
+      const subs = Number(r[COL.SUBS_COST-1])||0;
+      const mk   = Number(r[COL.MK-1])||0;
+
+      const rateSell = Number(r[COL.RATE-1])||0;             // sell $/hr as entered/overwritten
+      const sellM    = Number(r[COL.SELL_MAT-1])||0;         // calculated $ material
+      const sellS    = Number(r[COL.SELL_SUB-1])||0;         // calculated $ subs
+
+      const task = String(r[COL.TASK-1]||'').trim(); if (!task) continue;
+      const codeRaw = String(r[COL.COST_CODE-1]||'').trim();
+      const code = asTextCode_(codeRaw || (idx[task]?.costCode || ''));  // keep as text
+      const lineCostRate = Number(r[COL.COST_RATE_HR-1]) || (idx[task]?.costRate || costHrDefault);
+
+      // LABOUR
+      if (lhrs > 0){
+        lines.push([
+          task, code, 'L', desc, 'HOURS', lhrs, lineCostRate, rateSell
+        ]);
+      }
+      // MATERIAL quoted (MQ)
+      if (mat > 0){
+        const area = Number(r[COL.SELL_UNUSED-1]) || 0;
+        if (task === 'CCEILTILE' && area > 0){
+          const qty = roundTo_(area, 2);
+          const unitCost = roundTo_(mat / area, 2);
+          const unitPrice = roundTo_(mat / area, 2);
+          lines.push([
+            task, code, 'MQ', desc + ' - Material', 'SQFT', qty, unitCost, unitPrice
+          ]);
+        } else {
+          const sellMat = sellM || (mat * (1 + mk));
+          lines.push([
+            task, code, 'MQ', desc + ' - Material', 'EACH', 1, mat, sellMat
+          ]);
+        }
+      }
+      // SUBTRADE (S)
+      if (subs > 0){
+        const sellSub = sellS || (subs * (1 + mk));
+        lines.push([
+          task, code, 'S', desc + ' - Subcontractor', 'EACH', 1, subs, sellSub
+        ]);
+      }
+    }
+  });
+
+  const csv = lines.map(r=>r.map(v=>String(v).replace(/"/g,'""')).map(v=>`"${v}"`).join(',')).join('\n');
+  const name = 'Estimation_'+Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyyMMdd_HHmmss')+'.csv';
+  return { name, csv };
+}
+
+/** Open a tiny dialog that triggers a direct download using a data URL */
+function openDownload_(filename, csvText){
+  const b64 = Utilities.base64Encode(csvText, Utilities.Charset.UTF_8);
+  const html = HtmlService.createHtmlOutput(
+    '<html><head><meta charset="utf-8"></head><body>' +
+    '<a id="dl" href="data:text/csv;base64,'+ b64 +'" download="'+ filename +'">download</a>' +
+    '<script>document.getElementById("dl").click();google.script.host.close();</script>' +
+    '</body></html>'
+  ).setWidth(10).setHeight(10);
+  SpreadsheetApp.getUi().showModalDialog(html, 'Downloading');
+}
+
+/** Public download actions */
+function Download_Project_Tasks_CSV(){
+  const { name, csv } = buildProjectTasksCSV_();
+  openDownload_(name, csv);
+}
+function Download_Estimation_CSV(){
+  const { name, csv } = buildEstimationCSV_();
+  openDownload_(name, csv);
+}
+
+/** Optional Drive exporters if you still want them around */
+function getExportFolder(){
+  const folders = DriveApp.getFoldersByName(EXPORT_FOLDER);
+  if (folders.hasNext()) return folders.next();
+  return DriveApp.createFolder(EXPORT_FOLDER);
+}
+
+/** Optional unmerge everywhere */
+function Unmerge_All_Sheets(){ SpreadsheetApp.getActive().getSheets().forEach(unmergeAll); }
+
+function refreshTemplatePickerFor_(div){
+  const sh = SpreadsheetApp.getActive().getSheetByName(div.sheet);
+  const opts = templateOptions(div);
+  const dv = SpreadsheetApp.newDataValidation()
+    .requireValueInList(opts, true)
+    .build();
+  sh.getRange('B8').setDataValidation(dv);
+}
+
+function Refresh_Template_Pickers(){
+  DIVS.forEach(div => refreshTemplatePickerFor_(div));
+}
+
+/************************** CONFIG **************************/
+const HUMI = {
+  SHEET_ID: '1jIAtvQ87J9Fs9SGB4XYA7xzRVzTjpzWi8dP3k1WCNPc', // set null to use the active spreadsheet
+  TOKEN_PROP: 'HUMI_TOKEN',
+  WEBHOOK_SECRET_PROP: 'HUMI_WEBHOOK_SECRET',
+  BASE: 'https://partners.humi.ca',
+  PAGE_SIZE: 25, // Humi max per page is 25
+
+  TAB_TIMEOFF: 'TimeOff Request',
+  TAB_EMP: 'Employee IDs',
+
+  TAB_LOG_TIMEOFF_PAGE: 'Humi TimeOff Pull Log',
+  TAB_LOG_TIMEOFF_ITEM: 'Humi TimeOff Item Log',
+  TAB_LOG_EMP: 'Humi Employee Sync Log',
+  TAB_LOG_EMAIL: 'Email Log',
+  TAB_LOG_CAL: 'Calendar Log'
+};
+
+// watermark for incremental employee sync
+const HUMI_EMP_LAST_SYNC_PROP = 'HUMI_EMP_LAST_SYNC_ISO';
+const HUMI_EMP_LAST_FULL_PROP = 'HUMI_EMP_LAST_FULL_ISO';  // last full sync timestamp
+const INCR_CUSHION_DAYS = 3;   // always reprocess the most recent few days
+const FULL_EVERY_DAYS  = 7;    // force a full sync at least this often
+// Resumable Verify-All job settings
+const VERIFY_JOB = {
+  IDS_PROP:   'HUMI_VERIFY_IDS_JSON',  // JSON array of IDs to verify
+  CURSOR_PROP:'HUMI_VERIFY_CURSOR',    // integer index into the array
+  RUN_ID_PROP:'HUMI_VERIFY_RUN_ID',    // for reference/logging
+  CHUNK:      20,                      // how many employees per chunk
+  DELAY_MS:   120,                     // polite pause between calls
+  BUDGET_MS:  330000                   // ~5.5 minutes; bail before 6m limit
+};
+
+// idempotency keys for sent request emails
+const SENT_PROP_PREFIX = 'TOREQ_SENT_';
+function _timeOffKey_(empId, startDate, endDate, type, to) {
+  return [
+    String(empId || '').trim(),
+    _asYMD(startDate),
+    _asYMD(endDate),
+    String(type || '').trim().toLowerCase(),
+    String(to || '').trim().toLowerCase()
+  ].join('|');
+}
+
+// Logs only on change
+const LOG_CFG  = { PAGE: false, ITEM: true, SUMMARY_ON_CHANGE: true };
+const LOCK_CFG = { TRY_MS: 1500 };
+
+const TIMEOFF_HEADERS = [
+  'ID','Employee ID','Type','Start Date','End Date','Status','Description',
+  'Total Days','Total Hours','Created At','Updated At'
+];
+
+// L..P, Column O is event id
+const TIMEOFF_EXTRA_FIXED = [
+  [12, 'Employee Name'],
+  [13, 'Department'],
+  [14, 'Approver Email'],
+  [15, 'Calendar Event ID'],
+  [16, 'Request Email Sent']
+];
+
+const INVITES_START_ROW = 1787;
+
+const CALENDAR_ID = 'primary';
+const EMAIL_CFG = {
+  ENABLED: true,
+  TERMINATION_TO: 'leaders@meadowb.com',
+  SENDER_NAME: 'MeadowBrook Automations'
+};
+
+const SENSITIVE_TYPES = ['Bereavement', 'Paid Injury'];
+
+/************************** UTILITIES **************************/
+const _norm = s => String(s).trim().toLowerCase();
+function _asYMD(d) {
+  if (!d) return '';
+  const dt = (d instanceof Date) ? d : new Date(d);
+  return Utilities.formatDate(dt, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+}
+function parseDate(input) {
+  if (input instanceof Date) return input;
+  const s = String(input || '').trim();
+  if (!s) return new Date(NaN);
+  const parts = s.split('T')[0].split('-');
+  if (parts.length === 3) {
+    const y = parseInt(parts[0], 10), m = parseInt(parts[1], 10)-1, d = parseInt(parts[2], 10);
+    return new Date(y, m, d);
+  }
+  return new Date(s);
+}
+function _escapeHtml(s) {
+  return String(s || '')
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+// NEW: helper for tolerant field fallback
+function _firstNonEmpty() {
+  for (let i = 0; i < arguments.length; i++) {
+    const v = arguments[i];
+    if (v !== null && v !== undefined && String(v).trim() !== '') return v;
+  }
+  return '';
+}
+function _verifyGetIds_() {
+  const raw = PropertiesService.getScriptProperties().getProperty(VERIFY_JOB.IDS_PROP);
+  try { return raw ? JSON.parse(raw) : []; } catch (_e) { return []; }
+}
+function _verifySetIds_(ids) {
+  PropertiesService.getScriptProperties().setProperty(VERIFY_JOB.IDS_PROP, JSON.stringify(ids || []));
+}
+function _verifyGetCursor_() {
+  const v = PropertiesService.getScriptProperties().getProperty(VERIFY_JOB.CURSOR_PROP);
+  const n = parseInt(v || '0', 10);
+  return isNaN(n) ? 0 : n;
+}
+function _verifySetCursor_(n) {
+  PropertiesService.getScriptProperties().setProperty(VERIFY_JOB.CURSOR_PROP, String(Math.max(0, n|0)));
+}
+function _verifyClearState_() {
+  const p = PropertiesService.getScriptProperties();
+  p.deleteProperty(VERIFY_JOB.IDS_PROP);
+  p.deleteProperty(VERIFY_JOB.CURSOR_PROP);
+  p.deleteProperty(VERIFY_JOB.RUN_ID_PROP);
+}
+// --- Repeating cron helpers for verify_all_worker ---
+// Create a repeating, every-minute trigger for the worker if missing
+function ensure_verify_worker_trigger() {
+  const exists = ScriptApp.getProjectTriggers()
+    .some(t => t.getHandlerFunction() === 'verify_all_worker');
+  if (!exists) {
+    ScriptApp.newTrigger('verify_all_worker')
+      .timeBased()
+      .everyMinutes(1)
+      .create();
+
+    // log so you can see it in the sheet
+    _logRow_(
+      HUMI.TAB_LOG_EMP,
+      ['Timestamp','Action','ID','Field','Old','New'],
+      [new Date().toISOString(), 'VERIFY_CRON_ON', '', 'everyMinutes', '', '1'],
+      true
+    );
+    Logger.log('verify_all_worker repeating trigger created');
+  }
+}
+
+// Remove the repeating trigger (called when the queue finishes)
+function disable_verify_worker_trigger() {
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === 'verify_all_worker') ScriptApp.deleteTrigger(t);
+  });
+  _logRow_(
+    HUMI.TAB_LOG_EMP,
+    ['Timestamp','Action','ID','Field','Old','New'],
+    [new Date().toISOString(), 'VERIFY_CRON_OFF', '', '', '', ''],
+    true
+  );
+}
+
+function _verifyScheduleWorker_(delayMs) {
+  // keep only one pending worker trigger
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === 'verify_all_worker') ScriptApp.deleteTrigger(t);
+  });
+
+  const MIN_MS = 60 * 1000;                       // Apps Script requires >= 1 minute
+  const wait = Math.max(MIN_MS, Number(delayMs) || MIN_MS);
+
+  try {
+    ScriptApp.newTrigger('verify_all_worker')
+      .timeBased()
+      .after(wait)
+      .create();
+  } catch (e) {
+    // If creating the trigger fails due to missing auth, run one chunk now.
+    Logger.log('Trigger creation failed, running worker once now: %s', e);
+    verify_all_worker();
+  }
+}
+
+
+
+/************************** SHEET HELPERS **************************/
+function _openSS() { return HUMI.SHEET_ID ? SpreadsheetApp.openById(HUMI.SHEET_ID) : SpreadsheetApp.getActiveSpreadsheet(); }
+function _getSheet(name) {
+  const ss = _openSS();
+  let sh = ss.getSheetByName(name);
+  if (!sh) sh = ss.insertSheet(name);
+  return sh;
+}
+function _ensureHeadersRow(sh, labels) {
+  sh.getRange(1, 1, 1, labels.length).setValues([labels]);
+  if (sh.getFrozenRows() < 1) sh.setFrozenRows(1);
+}
+function _ensureTimeOffHeaderBlock(sh) {
+  _ensureHeadersRow(sh, TIMEOFF_HEADERS);
+  const totalCols = Math.max(16, sh.getLastColumn());
+  TIMEOFF_EXTRA_FIXED.forEach(([col, title]) => sh.getRange(1, col).setValue(title));
+  if (sh.getFrozenRows() < 1) sh.setFrozenRows(1);
+  try {
+    const maxRows = Math.max(0, sh.getMaxRows() - 1);
+    if (maxRows > 0) {
+      sh.getRange(2, 4, maxRows, 1).setNumberFormat('yyyy-MM-dd');
+      sh.getRange(2, 5, maxRows, 1).setNumberFormat('yyyy-MM-dd');
+      sh.getRange(2,10, maxRows, 1).setNumberFormat('yyyy-MM-dd');
+      sh.getRange(2,11, maxRows, 1).setNumberFormat('yyyy-MM-dd');
+    }
+  } catch (_e) {}
+}
+
+/************************** VERIFY ALL IDS (single endpoint) **************************/
+/** Walk every ID in the "Employee IDs" sheet and upsert from /v1/employees/:id.
+ *  This guarantees End Date (and any other attributes) are written even if the
+ *  list endpoint lags. Limit is optional; omit to verify all.
+ */
+function verifyAllEmployeesFromSheet(limit) {
+  const { sh, col } = _empEnsureHeaders_();
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) return { scanned: 0, ok: 0, fail: 0 };
+
+  const rows = lastRow - 1;
+  const ids  = sh.getRange(2, col['ID'], rows, 1)
+                 .getDisplayValues()
+                 .flat()
+                 .map(s => String(s || '').trim())
+                 .filter(Boolean);
+
+  const max = (typeof limit === 'number' && limit > 0) ? Math.min(limit, ids.length) : ids.length;
+
+  let scanned = 0, ok = 0, fail = 0;
+  for (let i = 0; i < max; i++) {
+    const id = ids[i];
+    const res = upsertEmployeeByIdNow(id);    // single-employee endpoint
+    scanned++;
+    if (res && res.ok) ok++; else fail++;
+    Utilities.sleep(80);                      // be polite to the API
+  }
+  Logger.log('verifyAllEmployeesFromSheet: scanned=%s ok=%s fail=%s', scanned, ok, fail);
+  return { scanned, ok, fail };
+}
+
+// Convenience runner you can run manually right now
+function run_verify_all_now() {
+  return verifyAllEmployeesFromSheet();       // verifies ALL rows
+}
+
+
+/************************** CANONICALIZATION **************************/
+const _TOF_DATE_COLS = new Set([4,5,10,11]);
+const _TOF_NUM_COLS  = new Set([8,9]);
+
+function _canonTofValue_(v, colIdx) {
+  if (v === null || v === undefined || v === '') return '';
+  if (_TOF_DATE_COLS.has(colIdx)) {
+    const d = (v instanceof Date) ? v : new Date(String(v));
+    return isNaN(d) ? String(v).trim() : Utilities.formatDate(d, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+  }
+  if (_TOF_NUM_COLS.has(colIdx)) {
+    const n = Number(v);
+    if (isNaN(n)) return String(v).trim();
+    return String(n);
+  }
+  return String(v).trim();
+}
+function _canonTofRow_(arr) {
+  const out = new Array(11);
+  for (let i = 0; i < 11; i++) out[i] = _canonTofValue_(arr[i], i+1);
+  return out;
+}
+function _equalTofRows_(a, b) {
+  if (!a || !b || a.length !== 11) return false;
+  for (let i = 0; i < 11; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+/************************** CALENDAR HELPERS **************************/
+function _eventsEqual_(existing, desired) {
+  if (!existing) return false;
+
+  function ymd(obj, fallbackTz) {
+    if (!obj) return '';
+    if (obj.date) return String(obj.date).trim();
+    if (obj.dateTime) {
+      const tz = (obj.timeZone || fallbackTz || Session.getScriptTimeZone());
+      const dt = new Date(String(obj.dateTime));
+      return Utilities.formatDate(dt, tz, 'yyyy-MM-dd');
+    }
+    return '';
   }
 
-  return lines.join('\n');
+  const sumEq   = String(existing.summary || '').trim() === String(desired.summary || '').trim();
+  const startEq = ymd(existing.start, existing.start && existing.start.timeZone) === ymd(desired.start, desired.start && desired.start.timeZone);
+  const endEq   = ymd(existing.end,   existing.end   && existing.end.timeZone)   === ymd(desired.end,   desired.end   && desired.end.timeZone);
+
+  function attSet(list) {
+    const s = new Set();
+    (list || []).forEach(a => {
+      const e = String(a && a.email || '').trim().toLowerCase();
+      if (e) s.add(e);
+    });
+    return s;
+  }
+  const ex = attSet(existing.attendees);
+  const de = attSet(desired.attendees);
+  const attEq = ex.size === de.size && [...ex].every(e => de.has(e));
+
+  return sumEq && startEq && endEq && attEq;
 }
 
-/* ---------------- helpers ---------------- */
-
-function exportSingleSheetToPdf(ssId, sheetId, pdfName) {
-  const url = `https://docs.google.com/spreadsheets/d/${ssId}/export?` +
-    `format=pdf&portrait=false&size=letter&scale=2&sheetnames=false&printtitle=false` +
-    `&pagenumbers=false&gridlines=false&fzr=false&gid=${sheetId}`;
-  const token = ScriptApp.getOAuthToken();
-  const resp = UrlFetchApp.fetch(url, { headers: { Authorization: 'Bearer ' + token } });
-  return resp.getBlob().setName(pdfName + '.pdf');
+function _getEventIfExists_(eventId) {
+  try { return Calendar.Events.get(CALENDAR_ID, eventId); } catch (_e) { return null; }
 }
 
-function log(msg) {
+/************************** LOGGING **************************/
+function _logRow_(tabName, headers, rowValues, force) {
+  if (!force && !LOG_CFG.PAGE && tabName === HUMI.TAB_LOG_TIMEOFF_PAGE) return;
+  const sh = _getSheet(tabName);
+  const have = sh.getLastColumn() ? sh.getRange(1,1,1,Math.max(sh.getLastColumn(), headers.length)).getValues()[0] : [];
+  if (!have.length) {
+    sh.getRange(1,1,1,headers.length).setValues([headers]);
+    sh.setFrozenRows(1);
+  } else if (have.length < headers.length || headers.some((h,i)=>_norm(have[i]||'') !== _norm(headers[i]))) {
+    sh.getRange(1,1,1,headers.length).setValues([headers]);
+    if (sh.getFrozenRows() < 1) sh.setFrozenRows(1);
+  }
+  sh.insertRowsAfter(1, 1);
+  sh.getRange(2,1,1,headers.length).setValues([rowValues]);
+}
+function _logTimeoffSummary({ when, pages, read, wrote, inserts, updates, unchanged, deletes }) {
+  if (!LOG_CFG.SUMMARY_ON_CHANGE) return;
+  if (!wrote && !deletes) return;
+  const cols = ['When','Level','Endpoint','Page','HTTP','Count','Sample IDs','URL','Note','Extra'];
+  const row = [
+    (when instanceof Date ? when.toISOString() : String(when)),
+    'SUMMARY','',pages,'',read,'','',
+    'Wrote ' + (wrote || 0) + ' rows',
+    JSON.stringify({ inserts, updates, unchanged, deletes, statusesIncluded: ['approved'] })
+  ];
+  _logRow_(HUMI.TAB_LOG_TIMEOFF_PAGE, cols, row, true);
+}
+function _logTimeoffItem({ action, id, empId, name, status, type, start, end, createdAt, updatedAt, row, source }) {
+  if (!LOG_CFG.ITEM) return;
+  if (action !== 'INSERT' && action !== 'UPDATE' && action !== 'DELETE') return;
+  const cols = ['When','Action','ID','Employee ID','Employee Name','Status','Type','Start','End','Created At','Updated At','Row','Source'];
+  const now = new Date().toISOString();
+  const rowVals = [now, action, id||'', empId||'', name||'', status||'', type||'', start||'', end||'', createdAt||'', updatedAt||'', row||'', source||''];
+  _logRow_(HUMI.TAB_LOG_TIMEOFF_ITEM, cols, rowVals, true);
+}
+function _logEmployeeChange({ action, id, field, oldVal, newVal }) {
+  const cols = ['Timestamp','Action','ID','Field','Old','New'];
+  _logRow_(HUMI.TAB_LOG_EMP, cols, [new Date().toISOString(), action, id, field, String(oldVal), String(newVal)], true);
+}
+function _logEmail({ kind, to, subject, body, row, relatedId }) {
+  const cols = ['When','Kind','Row','Related ID','To','Subject','Body (first 400 chars)'];
+  const preview = String(body || '').slice(0, 400);
+  _logRow_(HUMI.TAB_LOG_EMAIL, cols, [new Date().toISOString(), kind, row||'', relatedId||'', to||'', subject||'', preview], true);
+}
+function _logCalendar({ action, row, eventId, summary, sendUpdates, extra }) {
+  const cols = ['When','Action','Row','Event ID','Summary','SendUpdates','Extra'];
+  _logRow_(HUMI.TAB_LOG_CAL, cols, [new Date().toISOString(), action, row||'', eventId||'', summary||'', sendUpdates||'', extra||''], true);
+}
+
+/************************** FETCH **************************/
+function _fetchWithRetries_(url, token) {
+  const headers = { Authorization: 'Bearer ' + token, Accept: 'application/vnd.api+json' };
+  const opts = { method: 'get', muteHttpExceptions: true, headers };
+  let lastCode = 0, lastText = '';
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const resp = UrlFetchApp.fetch(url, opts);
+    const code = resp.getResponseCode();
+    const text = resp.getContentText() || '';
+    if (code === 200) {
+      let json = {};
+      try { json = JSON.parse(text || '{}'); } catch (_e) { json = {}; }
+      return { code, text, json };
+    }
+    lastCode = code; lastText = text;
+    if (code >= 500 || code === 429) { Utilities.sleep(250 * (attempt + 1)); continue; }
+    break;
+  }
+  let json = {};
+  try { json = JSON.parse(lastText || '{}'); } catch (_e) { json = {}; }
+  return { code: lastCode, text: lastText, json };
+}
+
+function _fetchEmployeesAllStatuses_(token) {
+  const pageSize = Math.min(HUMI.PAGE_SIZE || 25, 25);
+  let page = 1;
+  let pagesFetched = 0;
+  const employees = [];
+  while (true) {
+    const url = HUMI.BASE + '/v1/employees?filter[status]=all&page[size]=' + pageSize + '&page[number]=' + page;
+    const { code, json, text } = _fetchWithRetries_(url, token);
+    if (code !== 200) throw new Error('Humi employees ' + code + ': ' + text);
+    const items = Array.isArray(json && json.data) ? json.data : [];
+    if (!items.length) break;
+    console.log(`Fetched Humi employees page ${page} (${items.length} records)`);
+    Logger.log('Fetched Humi employees page %s (%s records)', page, items.length);
+    employees.push(...items);
+    pagesFetched += 1;
+    if (items.length < pageSize) break;
+    page += 1;
+  }
+  return { employees, pages: pagesFetched };
+}
+
+/************************** TIME OFF PULL (approved only) **************************/
+function pullHumiTimeOffAllStatuses(startYMD, endYMD) {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(LOCK_CFG.TRY_MS)) return { skipped: 'locked' };
   try {
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
-    if (!ss) { Logger.log(msg); return; }
-    let sh = ss.getSheetByName(SET.logSheet);
-    if (!sh) sh = ss.insertSheet(SET.logSheet);
-    sh.appendRow([new Date(), msg]);
-  } catch (err) { Logger.log(msg); }
+    _assertYMD_(startYMD, 'startYMD');
+    _assertYMD_(endYMD,   'endYMD');
+
+    const token = (PropertiesService.getScriptProperties().getProperty(HUMI.TOKEN_PROP) || '').trim();
+    if (!token) throw new Error('Missing script property ' + HUMI.TOKEN_PROP);
+
+    const shTimeOff = _getSheet(HUMI.TAB_TIMEOFF);
+    _ensureTimeOffHeaderBlock(shTimeOff);
+
+    const qsBase = [
+      'dateRange[start]=' + encodeURIComponent(startYMD),
+      'dateRange[end]='   + encodeURIComponent(endYMD),
+      'page[size]='       + Math.min(HUMI.PAGE_SIZE, 25)
+    ].join('&');
+
+    const ENDPOINTS = ['/v1/timeoff']; // approved only
+
+    const { idToRow, currentValues } = _indexSheetById_(shTimeOff, TIMEOFF_HEADERS);
+
+    const returnedIds = new Set();
+    let totalPages = 0;
+
+    const toInsert = [];
+    let inserts = 0, updates = 0, unchanged = 0;
+
+    function rowPayload(it) {
+      const a = it.attributes || {};
+      return [
+        it.id || a.id || '',
+        a.employee_id || '',
+        a.type || '',
+        a.start_at || '',
+        a.end_at || '',
+        a.status || '',
+        a.description == null ? '' : String(a.description),
+        a.total_amount_days == null ? '' : a.total_amount_days,
+        a.total_amount_hours == null ? '' : a.total_amount_hours,
+        a.created_at || '',
+        a.updated_at || ''
+      ];
+    }
+
+    for (const ep of ENDPOINTS) {
+      let page = 1;
+      while (true) {
+        const url = HUMI.BASE + ep + '?' + qsBase + '&page[number]=' + page;
+        const { code, text, json } = _fetchWithRetries_(url, token);
+        let items = [];
+        try { items = Array.isArray(json.data) ? json.data : []; } catch (e) { items = []; }
+        if (code !== 200 || !items.length) break;
+
+        for (const it of items) {
+          const a = it.attributes || {};
+          const id = String(it.id || a.id || '');
+          if (!id) continue;
+          returnedIds.add(id);
+
+          const rowData = rowPayload(it);
+          const rowIdx = idToRow.get(id);
+
+          if (rowIdx) {
+            const currentRaw = currentValues.get(rowIdx) || shTimeOff.getRange(rowIdx, 1, 1, TIMEOFF_HEADERS.length).getValues()[0];
+            const curCanon    = _canonTofRow_(currentRaw);
+            const targetCanon = _canonTofRow_(rowData);
+            const changed = !_equalTofRows_(curCanon, targetCanon);
+
+            if (changed) {
+              shTimeOff.getRange(rowIdx, 1, 1, TIMEOFF_HEADERS.length).setValues([rowData]);
+              currentValues.set(rowIdx, rowData.slice());
+              updates += 1;
+              _logTimeoffItem({
+                action: 'UPDATE', id, empId: a.employee_id || '', name: _lookupEmployeeName_(a.employee_id),
+                status: a.status || '', type: a.type || '',
+                start: a.start_at || '', end: a.end_at || '', createdAt: a.created_at || '', updatedAt: a.updated_at || '',
+                row: rowIdx, source: ep
+              });
+            } else {
+              unchanged += 1;
+            }
+          } else {
+            toInsert.push(rowData);
+            inserts += 1;
+            _logTimeoffItem({
+              action: 'INSERT', id, empId: a.employee_id || '', name: _lookupEmployeeName_(a.employee_id),
+              status: a.status || '', type: a.type || '',
+              start: a.start_at || '', end: a.end_at || '', createdAt: a.created_at || '', updatedAt: a.updated_at || '',
+              row: '', source: ep
+            });
+          }
+        }
+
+        totalPages += 1;
+        if (items.length < Math.min(HUMI.PAGE_SIZE, 25)) break;
+        Utilities.sleep(120);
+        page += 1;
+      }
+    }
+
+    if (toInsert.length) {
+      _ensureTimeOffHeaderBlock(shTimeOff);
+      shTimeOff.insertRowsAfter(1, toInsert.length);
+      shTimeOff.getRange(2, 1, toInsert.length, TIMEOFF_HEADERS.length).setValues(toInsert);
+    }
+
+    const deletes = _markMissingTimeOffAsDeleted_(shTimeOff, startYMD, endYMD, returnedIds);
+
+    _logTimeoffSummary({
+      when: new Date(), pages: totalPages, read: returnedIds.size, wrote: inserts + updates,
+      inserts, updates, unchanged, deletes
+    });
+
+    return { pages: totalPages, uniqueRead: returnedIds.size, inserts, updates, unchanged, deletes };
+
+  } finally {
+    try { lock.releaseLock(); } catch (_e) {}
+  }
 }
 
-function logExclude(line, reason) {
+/************************** DELETION RECONCILIATION **************************/
+function _markMissingTimeOffAsDeleted_(shTimeOff, startYMD, endYMD, returnedIds) {
+  const hdr = shTimeOff.getRange(1,1,1, Math.max(16, shTimeOff.getLastColumn())).getValues()[0].map(String);
+  const idx = name => hdr.findIndex(h => _norm(h) === _norm(name)) + 1;
+
+  const idCol     = 1;
+  const startCol  = idx('Start Date');
+  const endCol    = idx('End Date');
+  const statusCol = idx('Status');
+  const nameCol   = idx('Employee Name');
+  const empIdCol  = idx('Employee ID');
+  const eventIdCol= idx('Calendar Event ID');
+
+  const lastRow = shTimeOff.getLastRow();
+  if (lastRow < 2) return 0;
+
+  const rows = lastRow - 1;
+  const ids     = shTimeOff.getRange(2, idCol, rows, 1).getDisplayValues().flat();
+  const starts  = shTimeOff.getRange(2, startCol, rows, 1).getValues().flat();
+  const ends    = shTimeOff.getRange(2, endCol, rows, 1).getValues().flat();
+  const statusV = shTimeOff.getRange(2, statusCol, rows, 1).getDisplayValues().flat();
+  const names   = shTimeOff.getRange(2, nameCol, rows, 1).getDisplayValues().flat();
+  const empIds  = shTimeOff.getRange(2, empIdCol, rows, 1).getDisplayValues().flat();
+  const evIds   = shTimeOff.getRange(2, eventIdCol, rows, 1).getDisplayValues().flat();
+
+  const winStart = parseDate(startYMD + 'T00:00:00');
+  const winEnd   = parseDate(endYMD   + 'T23:59:59');
+
+  let deletedCount = 0;
+
+  for (let i = 0; i < rows; i++) {
+    const row = i + 2;
+    const id = String(ids[i] || '').trim();
+    if (!id) continue;
+
+    const st = parseDate(starts[i]);
+    const en = parseDate(ends[i]);
+    const overlapsWindow = !isNaN(st) && !isNaN(en) && (st <= winEnd && en >= winStart);
+    if (!overlapsWindow) continue;
+
+    const prevStatus = _norm(statusV[i] || '');
+    if (prevStatus !== 'approved') continue;
+
+    if (!returnedIds.has(id)) {
+      shTimeOff.getRange(row, statusCol).setValue('deleted');
+
+      const existingId = String(evIds[i] || '').trim();
+      if (existingId && existingId !== 'N/A') {
+        try {
+          Calendar.Events.remove(CALENDAR_ID, existingId, { sendUpdates: 'none' });
+          _logCalendar({ action: 'DELETE', row, eventId: existingId, summary: (names[i] || '') + ' Away', sendUpdates: 'none' });
+        } catch (e) {
+          _logCalendar({ action: 'DELETE_FAIL', row, eventId: existingId, summary: (names[i] || '') + ' Away', sendUpdates: 'none', extra: String(e) });
+        }
+        shTimeOff.getRange(row, eventIdCol).clearContent();
+      }
+
+      _logTimeoffItem({
+        action: 'DELETE',
+        id,
+        empId: String(empIds[i] || ''),
+        name: String(names[i] || ''),
+        status: 'deleted',
+        type: '',
+        start: _asYMD(starts[i]),
+        end: _asYMD(ends[i]),
+        createdAt: '',
+        updatedAt: new Date().toISOString(),
+        row,
+        source: 'reconcile'
+      });
+
+      deletedCount += 1;
+    }
+  }
+  return deletedCount;
+}
+
+/************************** ZAPIER INGEST **************************/
+function processZapierNewTimeOffRows() {
+  const lock = LockService.getScriptLock();
+  let haveLock = false;
   try {
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
-    let sh = ss.getSheetByName(SET.logSheet);
-    if (!sh) sh = ss.insertSheet(SET.logSheet);
-    sh.appendRow([
-      new Date(),
-      'excluded',
-      reason,
-      line.projectTask || '',
-      line.description || '',
-      line.costAccountGroup || '',
-      line.costCode || '',
-      line.quantity || 0,
-      line.unitCost || 0,
-      line.unitPrice || 0,
-      line.extCost || 0,
-      line.extPrice || 0
-    ]);
+    lock.waitLock(30000);
+    haveLock = true;
+  } catch (e) {
+    const msg = 'processZapierNewTimeOffRows skipped: could not acquire lock within 30s';
+    console.log(msg);
+    Logger.log(msg);
+    _logRow_(
+      HUMI.TAB_LOG_EMP,
+      ['Timestamp','Action','ID','Field','Old','New'],
+      [new Date().toISOString(), 'ZAP_SYNC_SKIPPED', '', '', '', 'lock busy'],
+      true
+    );
+    return { skipped: 'locked', error: String(e) };
+  }
+  try {
+    const sh = _getSheet(HUMI.TAB_TIMEOFF);
+    _ensureTimeOffHeaderBlock(sh);
+
+    const hdr = sh.getRange(1,1,1, Math.max(16, sh.getLastColumn())).getValues()[0].map(String);
+    const idx = name => hdr.findIndex(h => _norm(h) === _norm(name)) + 1;
+
+    const empIdCol    = idx('Employee ID');
+    const startCol    = idx('Start Date');
+    const endCol      = idx('End Date');
+    const nameCol     = idx('Employee Name');
+    const deptCol     = idx('Department');
+    const approverCol = idx('Approver Email');
+    const reqSentCol  = idx('Request Email Sent');
+
+    const lastRow = sh.getLastRow();
+    if (lastRow < 2) return;
+
+    const rows = lastRow - 1;
+    const vals = sh.getRange(2,1,rows,Math.max(16, sh.getLastColumn())).getValues();
+    for (let i=0; i<rows; i++) {
+      const row = i + 2;
+      const empId = String(vals[i][empIdCol - 1] || '').trim();
+      if (!empId) continue;
+
+      const alreadyEmailed = String(vals[i][reqSentCol - 1] || '').toUpperCase() === 'Y';
+      if (!alreadyEmailed) {
+        const currentName = String(vals[i][nameCol - 1] || '');
+        const currentDept = String(vals[i][deptCol - 1] || '');
+        if (!currentName || !currentDept) {
+          const info = _lookupEmployeeByIdFull_(empId);
+          if (!currentName && info.name) sh.getRange(row, nameCol).setValue(info.name);
+          if (!currentDept && info.department) sh.getRange(row, deptCol).setValue(info.department);
+        }
+
+        const dept = sh.getRange(row, deptCol).getDisplayValue();
+        const approver = _computeApproverEmail_(dept);
+        if (approver) sh.getRange(row, approverCol).setValue(approver);
+
+        const start = sh.getRange(row, startCol).getValue();
+        const end   = sh.getRange(row, endCol).getValue();
+
+        if (approver && start && end) {
+          _sendRequestEmail_(row, sh);
+          sh.getRange(row, reqSentCol).setValue('Y');
+        }
+      }
+    }
+  } finally { if (haveLock) { try { lock.releaseLock(); } catch (_e) {} } }
+}
+
+/************************** EMAILS **************************/
+function _sendRequestEmail_(row, sheet) {
+  if (!EMAIL_CFG.ENABLED) return;
+
+  const hdr = sheet.getRange(1,1,1,sheet.getLastColumn()).getValues()[0].map(String);
+  const idx = name => hdr.findIndex(h => _norm(h) === _norm(name)) + 1;
+
+  const idCol      = idx('ID');
+  const empIdCol   = idx('Employee ID');
+  const nameCol    = idx('Employee Name');
+  const typeCol    = idx('Type');
+  const startCol   = idx('Start Date');
+  const endCol     = idx('End Date');
+  const deptCol    = idx('Department');
+  const approverCol= idx('Approver Email');
+
+  const tofId         = sheet.getRange(row, idCol).getDisplayValue().trim();
+  const employeeName  = sheet.getRange(row, nameCol).getDisplayValue();
+  const typeOfTimeOff = sheet.getRange(row, typeCol).getDisplayValue();
+  const startDate     = parseDate(sheet.getRange(row, startCol).getValue());
+  const endDate       = parseDate(sheet.getRange(row, endCol).getValue());
+  const department    = sheet.getRange(row, deptCol).getDisplayValue();
+  const to            = sheet.getRange(row, approverCol).getDisplayValue();
+  const empId         = sheet.getRange(row, empIdCol).getDisplayValue();
+
+  if (!to) return;
+
+  // prefer an ID based key that also captures date and type, fallback to composite if no ID is present
+  const props = PropertiesService.getScriptProperties();
+  const idKey = tofId
+    ? ['ID', tofId, _asYMD(startDate), _asYMD(endDate), String(typeOfTimeOff || '').trim().toLowerCase(), String(to || '').trim().toLowerCase()].join('|')
+    : null;
+  const compKey = _timeOffKey_(empId, startDate, endDate, typeOfTimeOff, to);
+  const finalKey = idKey || compKey;
+  if (props.getProperty(SENT_PROP_PREFIX + finalKey) === '1') return;
+
+  const formattedStart = Utilities.formatDate(startDate, Session.getScriptTimeZone(), 'EEE MMM dd yyyy');
+  const formattedEnd   = Utilities.formatDate(endDate,   Session.getScriptTimeZone(), 'EEE MMM dd yyyy');
+  const overlap        = _findOverlaps_(sheet, startDate, endDate, department, row);
+
+  let html = `<p>Hello,</p>
+  <p>${_escapeHtml(employeeName)} has requested time off:</p>
+  <ul>`;
+  if (!SENSITIVE_TYPES.includes(String(typeOfTimeOff))) {
+    html += `<li><strong>Type:</strong> ${_escapeHtml(typeOfTimeOff)}</li>`;
+  }
+  html += `<li><strong>Start:</strong> ${_escapeHtml(formattedStart)}</li>
+           <li><strong>End:</strong> ${_escapeHtml(formattedEnd)}</li>
+           </ul>`;
+
+  if (overlap.overlaps) {
+    html += `<p><strong>Overlaps within ${_escapeHtml(department)}:</strong></p><ul>`;
+    overlap.employees.forEach(e => {
+      html += `<li>${_escapeHtml(e.name)} ${_escapeHtml(e.typeOfTimeOff)} (${_escapeHtml(e.start)} → ${_escapeHtml(e.end)})</li>`;
+    });
+    html += `</ul>`;
+  } else {
+    html += `<p>No overlapping time off in this department.</p>`;
+  }
+
+  const subject = SENSITIVE_TYPES.includes(String(typeOfTimeOff))
+    ? `${employeeName} Time off request`
+    : `${employeeName} ${typeOfTimeOff} request`;
+
+  MailApp.sendEmail(to, subject, html, { htmlBody: html, name: EMAIL_CFG.SENDER_NAME });
+
+  // mark sent and log with the key
+  props.setProperty(SENT_PROP_PREFIX + finalKey, '1');
+  _logEmail({ kind: 'TimeOff Request', to, subject, body: html, row, relatedId: finalKey });
+}
+
+function _findOverlaps_(sheet, startDate, endDate, department, currentRow) {
+  const tz = Session.getScriptTimeZone();
+  const data = sheet.getDataRange().getValues();
+  const out = [];
+  for (let i=1; i<data.length; i++) {
+    const rowNum = i+1; if (rowNum === currentRow) continue;
+    const dep  = data[i][12];
+    const stat = String(data[i][5]||'').toLowerCase();
+    if (dep !== department || stat !== 'approved') continue;
+    const rs = parseDate(data[i][3]);
+    const re = parseDate(data[i][4]);
+    if (startDate <= re && endDate >= rs) {
+      out.push({
+        name: data[i][11],
+        typeOfTimeOff: data[i][2],
+        start: Utilities.formatDate(rs, tz, 'EEE MMM dd yyyy'),
+        end:   Utilities.formatDate(re, tz, 'EEE MMM dd yyyy')
+      });
+    }
+  }
+  return { overlaps: out.length > 0, employees: out };
+}
+
+// Optional: basic termination notice email
+function _sendTerminationEmail(first, last, dept) {
+  if (!EMAIL_CFG.ENABLED || !EMAIL_CFG.TERMINATION_TO) return;
+  const name = [first,last].filter(Boolean).join(' ');
+  const subj = `Employee terminated: ${name}`;
+  const html = `<p>${_escapeHtml(name)} was marked terminated in Humi.</p>
+                <p>Department: ${_escapeHtml(dept||'')}</p>`;
+  MailApp.sendEmail(EMAIL_CFG.TERMINATION_TO, subj, html, { htmlBody: html, name: EMAIL_CFG.SENDER_NAME });
+  _logEmail({ kind: 'Termination Notice', to: EMAIL_CFG.TERMINATION_TO, subject: subj, body: html, row: '', relatedId: '' });
+}
+
+/************************** EMPLOYEE SYNC **************************/
+function syncHumiEmployees(forceFull) {
+  const lock = LockService.getScriptLock();
+  let haveLock = false;
+  try {
+    lock.waitLock(45000);
+    haveLock = true;
+  } catch (e) {
+    const msg = 'syncHumiEmployees skipped: could not acquire lock within 45s';
+    console.log(msg);
+    Logger.log(msg);
+    _logRow_(
+      HUMI.TAB_LOG_EMP,
+      ['Timestamp','Action','ID','Field','Old','New'],
+      [new Date().toISOString(), 'SYNC_SKIPPED', '', '', '', 'lock busy'],
+      true
+    );
+    return { skipped: 'locked', error: String(e) };
+  }
+  try {
+    const token = (PropertiesService.getScriptProperties().getProperty(HUMI.TOKEN_PROP) || '').trim();
+    if (!token) throw new Error('Missing HUMI_TOKEN');
+
+    const props = PropertiesService.getScriptProperties();
+
+    // accept either property name, use the one that is present
+    const lastSyncIso =
+      props.getProperty(HUMI_EMP_LAST_SYNC_PROP) ||
+      props.getProperty('HUMI_LAST_SYNC') ||
+      null;
+
+    let doIncremental = !forceFull && !!lastSyncIso;
+
+    // escalate to full periodically as a safety net
+    const lastFullIso = props.getProperty(HUMI_EMP_LAST_FULL_PROP);
+    if (doIncremental && lastFullIso) {
+      const lastFull = new Date(lastFullIso);
+      if (!isNaN(lastFull)) {
+        const ageDays = Math.floor((Date.now() - lastFull.getTime()) / 86400000);
+        if (ageDays >= FULL_EVERY_DAYS) doIncremental = false;
+      }
+    }
+
+
+    const sh = _getSheet(HUMI.TAB_EMP);
+
+    const startMsg = `syncHumiEmployees invoked forceFull=${!!forceFull} lastSync=${lastSyncIso || 'none'} lastFull=${lastFullIso || 'none'} plannedMode=${doIncremental ? 'incremental' : 'full'}`;
+    console.log(startMsg);
+    Logger.log(startMsg);
+
+    _logRow_(
+      HUMI.TAB_LOG_EMP,
+      ['Timestamp','Action','ID','Field','Old','New'],
+      [
+        new Date().toISOString(),
+        'SYNC_START',
+        '',
+        '',
+        '',
+        JSON.stringify({ forceFull: !!forceFull, lastSyncIso, lastFullIso, doIncremental })
+      ],
+      true
+    );
+
+    const base = ['ID','First Name','Last Name','Email','Department','Position',
+                  'Employment Type','Start Date','End Date','Full Name','Status'];
+    const extras = ['Legal First Name','Legal Last Name','Work Phone','Mobile Phone','Office','Reports To ID','Created At','Updated At'];
+    const want = base.concat(extras);
+
+    // Ensure header row aligned
+    const lastCol = Math.max(want.length, sh.getLastColumn());
+    const hdr = (lastCol ? sh.getRange(1,1,1,lastCol).getValues()[0] : []);
+    if (!hdr.length) {
+      sh.getRange(1,1,1,want.length).setValues([want]);
+      sh.setFrozenRows(1);
+    } else {
+      for (let i=0; i<want.length; i++) sh.getRange(1, i+1).setValue(want[i]);
+      if (sh.getFrozenRows() < 1) sh.setFrozenRows(1);
+    }
+    const col = {}; want.forEach((h,i)=> col[h] = i+1);
+
+    // Index existing rows by ID and by lowercase Email
+    const sheetLastRow = sh.getLastRow();
+    const rows = Math.max(0, sheetLastRow - 1);
+    const sheetData = rows ? sh.getRange(2, 1, rows, want.length).getValues() : [];
+    const idIdx = col['ID'] - 1;
+    const emailIdx = col['Email'] - 1;
+    const statusIdx = col['Status'] - 1;
+    const firstIdx = col['First Name'] - 1;
+    const lastIdx = col['Last Name'] - 1;
+    const deptIdx = col['Department'] - 1;
+    const idToIndex = new Map();
+    const emailToIndex = new Map();
+    sheetData.forEach((row, idx) => {
+      const idVal = String(row[idIdx] || '').trim();
+      if (idVal) idToIndex.set(idVal, idx);
+      const emailVal = String(row[emailIdx] || '').trim().toLowerCase();
+      if (emailVal) emailToIndex.set(emailVal, idx);
+    });
+
+
+
+    // --- robust mapping: ALWAYS writes End Date if present ---
+    function makeRow(it) {
+      const a = it.attributes || {};
+      const rawEnd = _firstNonEmpty(a.end_date, a.termination_date, a.terminated_at, a.employment_end_date);
+      const end    = _asYMD(rawEnd || '');
+
+      const statusRaw = String(a.status || a.employment_status || a.employee_status || '').trim().toLowerCase();
+
+      const first = a.first_name || '';
+      const last  = a.last_name || '';
+      const email = a.email || '';
+      const dept  = a.department || '';
+      const pos   = a.position || '';
+      const empT  = a.employment_type || '';
+      const start = _asYMD(a.start_date || '');
+      const full  = [first, last].filter(Boolean).join(' ');
+
+      // Guarantee: if End Date exists, Status=terminated
+      const status = end ? 'terminated' : (statusRaw ? statusRaw : 'active');
+
+      return [
+        it.id || a.id || '',
+        first, last, email,
+        dept, pos, empT,
+        start, end,
+        full, status,
+        a.legal_first_name || '', a.legal_last_name || '',
+        a.work_phone || '', a.mobile_phone || '',
+        a.office || '', a.reports_to_id || '',
+        a.created_at || '', a.updated_at || ''
+      ];
+    }
+
+    function upsertOne(it) {
+      const a = it.attributes || {};
+      const id = String(it.id || a.id || '').trim();
+      if (!id) return { inserted:false, updated:false, terminated:false };
+
+      const emailKey = String(a.email || '').trim().toLowerCase();
+      let idx = idToIndex.has(id) ? idToIndex.get(id) : null;
+      if ((idx === null || idx === undefined) && emailKey) {
+        const candidate = emailToIndex.get(emailKey);
+        if (candidate !== undefined) {
+          const existingId = String(sheetData[candidate][idIdx] || '').trim();
+          if (!existingId || existingId === id) idx = candidate;
+        }
+      }
+
+      const target = makeRow(it);
+
+      if (idx !== null && idx !== undefined) {
+        const current = sheetData[idx];
+        let different = false;
+        for (let c = 0; c < want.length; c++) {
+          if (String(current[c]) !== String(target[c])) { different = true; break; }
+        }
+        const becameTerminated = (String(current[statusIdx] || '').toLowerCase() !== 'terminated') &&
+                                 (String(target[statusIdx] || '').toLowerCase() === 'terminated');
+        if (different) {
+          const oldEmail = String(current[emailIdx] || '').trim().toLowerCase();
+          sheetData[idx] = target;
+          const newEmail = String(target[emailIdx] || '').trim().toLowerCase();
+          if (oldEmail && oldEmail !== newEmail) emailToIndex.delete(oldEmail);
+          if (newEmail) emailToIndex.set(newEmail, idx);
+          if (becameTerminated) _sendTerminationEmail(target[firstIdx], target[lastIdx], target[deptIdx]);
+        }
+        if (emailKey) emailToIndex.set(emailKey, idx);
+        idToIndex.set(id, idx);
+        return { inserted:false, updated:different, terminated:becameTerminated };
+      } else {
+        const newIdx = sheetData.length;
+        sheetData.push(target);
+        idToIndex.set(id, newIdx);
+        if (emailKey) emailToIndex.set(emailKey, newIdx);
+        return { inserted:true, updated:false, terminated:false };
+      }
+    }
+
+    let inserted = 0, updated = 0, processed = 0;
+    let pages = 0;
+
+    const nowIso = new Date().toISOString();
+    let newestSeenIso = lastSyncIso || null;
+    const tokenStr = (PropertiesService.getScriptProperties().getProperty(HUMI.TOKEN_PROP) || '').trim();
+
+    const { employees: apiEmployees, pages: pagesFetched } = _fetchEmployeesAllStatuses_(tokenStr);
+    pages = pagesFetched;
+    const totalFetched = apiEmployees.length;
+    console.log(`Humi API employees (all statuses): ${totalFetched}`);
+    Logger.log('Humi API employees (all statuses): %s', totalFetched);
+    _logRow_(
+      HUMI.TAB_LOG_EMP,
+      ['Timestamp','Action','ID','Field','Old','New'],
+      [new Date().toISOString(), 'SYNC_TOTAL', '', '', '', String(totalFetched)],
+      true
+    );
+
+    let itemsToProcess = apiEmployees;
+    let sinceDate = null;
+    if (doIncremental && lastSyncIso) {
+      const candidate = new Date(lastSyncIso);
+      if (!isNaN(candidate)) {
+        candidate.setMinutes(candidate.getMinutes() - 2);
+        candidate.setDate(candidate.getDate() - INCR_CUSHION_DAYS);
+        sinceDate = candidate;
+      }
+    }
+
+    if (sinceDate) {
+      console.log(`Starting incremental employee sync from watermark ${lastSyncIso || 'none'} forceFull=${!!forceFull}`);
+      Logger.log('Starting incremental employee sync from watermark %s (forceFull=%s)', lastSyncIso || 'none', !!forceFull);
+      itemsToProcess = apiEmployees.filter(it => {
+        const a = it.attributes || {};
+        const updatedAt = new Date(a.updated_at || a.created_at || '');
+        if (isNaN(updatedAt)) return true;
+        return updatedAt > sinceDate;
+      });
+      console.log(`Incremental filter retained ${itemsToProcess.length} of ${totalFetched} employees updated after ${sinceDate.toISOString()}`);
+      Logger.log('Incremental filter retained %s of %s employees updated after %s', itemsToProcess.length, totalFetched, sinceDate.toISOString());
+    } else if (doIncremental) {
+      console.log('Incremental sync requested but lastSyncIso missing or invalid; processing all employees.');
+      Logger.log('Incremental sync requested but lastSyncIso missing or invalid; processing all employees.');
+    } else {
+      console.log(`Starting full employee sync forceFull=${!!forceFull}`);
+      Logger.log('Starting full employee sync (forceFull=%s)', !!forceFull);
+    }
+
+    let returnedIds = null;
+    if (!doIncremental) {
+      returnedIds = new Set(apiEmployees
+        .map(it => String(it.id || (it.attributes || {}).id || '').trim())
+        .filter(Boolean));
+    }
+
+    for (const it of itemsToProcess) {
+      const a = it.attributes || {};
+      const res = upsertOne(it);
+      if (res.inserted) inserted++;
+      if (res.updated)  updated++;
+      processed++;
+      const idKey = String(it.id || a.id || '').trim();
+      if (returnedIds && idKey) returnedIds.add(idKey);
+
+      const u = new Date(a.updated_at || a.created_at || '');
+      if (!isNaN(u)) {
+        const iso = u.toISOString();
+        if (!newestSeenIso || iso > newestSeenIso) newestSeenIso = iso;
+      }
+    }
+
+    if (doIncremental && sinceDate && !itemsToProcess.length) {
+      Logger.log('Incremental sync detected no changes since %s', sinceDate.toISOString());
+      console.log(`Incremental sync detected no changes since ${sinceDate.toISOString()}`);
+    }
+
+    if (!doIncremental && sheetData.length) {
+      let markedDeleted = 0;
+      sheetData.forEach((rowArr, idx) => {
+        const rowId = String(rowArr[idIdx] || '').trim();
+        if (!rowId) return;
+        if (!returnedIds.has(rowId)) {
+          const currentStatus = String(rowArr[statusIdx] || '');
+          if (currentStatus.toLowerCase() !== 'deleted') {
+            rowArr[statusIdx] = 'deleted';
+            _logEmployeeChange({ action: 'mark_deleted', id: rowId, field: 'Status', oldVal: currentStatus, newVal: 'deleted' });
+            markedDeleted++;
+          }
+        }
+      });
+      if (markedDeleted) {
+        const delMsg = `Full sync marked ${markedDeleted} existing sheet rows as deleted (not returned by API)`;
+        console.log(delMsg);
+        Logger.log('Full sync marked %s existing sheet rows as deleted (not returned by API).', markedDeleted);
+      } else {
+        const delMsg = 'Full sync did not mark any additional rows as deleted.';
+        console.log(delMsg);
+        Logger.log('Full sync did not mark any additional rows as deleted.');
+      }
+    }
+
+    // Write back all rows in one batch
+    const totalRows = sheetData.length;
+    if (totalRows > 0) {
+      const neededRows = totalRows + 1;
+      if (sh.getMaxRows() < neededRows) {
+        sh.insertRowsAfter(sh.getMaxRows(), neededRows - sh.getMaxRows());
+      }
+      console.log(`Writing ${totalRows} employee rows to sheet.`);
+      Logger.log('Writing %s employee rows to sheet.', totalRows);
+      sh.getRange(2, 1, totalRows, want.length).setValues(sheetData);
+      const lastRowNow = sh.getLastRow();
+      if (lastRowNow > totalRows + 1) {
+        const extra = lastRowNow - (totalRows + 1);
+        sh.getRange(totalRows + 2, 1, extra, want.length).clearContent();
+      }
+    } else {
+      const currentLastRow = sh.getLastRow();
+      if (currentLastRow > 1) {
+        sh.getRange(2, 1, currentLastRow - 1, want.length).clearContent();
+      }
+    }
+
+    // advance watermark and keep both property names aligned
+    props.setProperty(HUMI_EMP_LAST_SYNC_PROP, newestSeenIso || nowIso);
+    props.setProperty('HUMI_LAST_SYNC',        newestSeenIso || nowIso);
+
+    // if this run was full, stamp last full watermark
+    if (!doIncremental || forceFull) {
+      props.setProperty(HUMI_EMP_LAST_FULL_PROP, nowIso);
+    }
+
+    const summary = {
+      mode: doIncremental ? 'incremental' : 'full',
+      totalFetched,
+      pages,
+      processed,
+      inserted,
+      updated,
+      newestSeenIso
+    };
+    console.log(`syncHumiEmployees summary: ${JSON.stringify(summary)}`);
+    Logger.log(JSON.stringify(summary, null, 2));
+
+    _logRow_(
+      HUMI.TAB_LOG_EMP,
+      ['Timestamp','Action','ID','Field','Old','New'],
+      [new Date().toISOString(), 'SYNC_DONE', '', '', '', JSON.stringify(summary)],
+      true
+    );
+
+  } finally {
+    if (haveLock) {
+      try { lock.releaseLock(); } catch (_e) {}
+    }
+  }
+}
+
+/************************** LOOKUPS **************************/
+function _lookupEmployeeName_(empId) {
+  const info = _lookupEmployeeByIdFull_(empId);
+  return info.name || '';
+}
+function _lookupEmployeeByIdFull_(empId) {
+  if (!empId) return { name: '', department: '' };
+  try {
+    const sh = _getSheet(HUMI.TAB_EMP);
+    const lastCol = sh.getLastColumn();
+    if (!lastCol) return { name: '', department: '' };
+    const hdr = sh.getRange(1,1,1,lastCol).getValues()[0].map(String);
+    const idIdx   = hdr.findIndex(h => _norm(h) === 'id');
+    const fullIdx = hdr.findIndex(h => _norm(h) === 'full name');
+    const fnIdx   = hdr.findIndex(h => _norm(h) === 'first name');
+    const lnIdx   = hdr.findIndex(h => _norm(h) === 'last name');
+    const deptIdx = hdr.findIndex(h => _norm(h) === 'department');
+    if (idIdx === -1) return { name: '', department: '' };
+
+    const rows = Math.max(0, sh.getLastRow() - 1);
+    if (!rows) return { name: '', department: '' };
+
+    const data = sh.getRange(2,1,rows,lastCol).getValues();
+    for (const r of data) {
+      if (String(r[idIdx]||'').trim() === String(empId).trim()) {
+        const name = (fullIdx !== -1 && r[fullIdx]) ? String(r[fullIdx]) :
+                     ([fnIdx !== -1 ? r[fnIdx] : '', lnIdx !== -1 ? r[lnIdx] : ''].join(' ').trim());
+        const dept = (deptIdx !== -1 && r[deptIdx]) ? String(r[deptIdx]) : '';
+        return { name: name || '', department: dept || '' };
+      }
+    }
+    return { name: '', department: '' };
+  } catch (_e) { return { name: '', department: '' }; }
+}
+
+/************************** VALIDATION **************************/
+function _assertYMD_(s, label) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(s || ''))) throw new Error(label + ' must be YYYY-MM-DD');
+}
+
+/************************** INDEX EXISTING A..K **************************/
+function _indexSheetById_(sh, headers) {
+  const lastRow = sh.getLastRow();
+  const idToRow = new Map();
+  const currentValues = new Map();
+  if (lastRow <= 1) return { idToRow, currentValues };
+  const colCount = headers.length;
+  const values = sh.getRange(2, 1, lastRow - 1, colCount).getValues();
+  for (let i = 0; i < values.length; i++) {
+    const rowIdx = i + 2;
+    const id = String(values[i][0] || '').trim();
+    if (id) { idToRow.set(id, rowIdx); currentValues.set(rowIdx, values[i]); }
+  }
+  return { idToRow, currentValues };
+}
+
+/************************** ONE TIME **************************/
+function markOldRowsNoInvite() {
+  const sh = _getSheet(HUMI.TAB_TIMEOFF);
+  _ensureTimeOffHeaderBlock(sh);
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) return;
+  const count = Math.min(lastRow, INVITES_START_ROW - 1) - 1;
+  if (count > 0) {
+    const range = sh.getRange(2, 15, count, 1);
+    const vals  = range.getValues().map(r => [String(r[0]||'').trim() ? r[0] : 'N/A']);
+    range.setValues(vals);
+  }
+}
+
+/************************** CALENDAR INVITES **************************/
+function syncCalendarInvites() {
+  // prevent overlapping runs
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(LOCK_CFG.TRY_MS)) return;
+
+  try {
+    const sh = _getSheet(HUMI.TAB_TIMEOFF);
+    _ensureTimeOffHeaderBlock(sh);
+
+    const lastRow = sh.getLastRow();
+    if (lastRow < 2) return;
+
+    // Fill historical rows with "N/A" so we never touch them
+    if (INVITES_START_ROW > 2) {
+      const count = Math.min(lastRow, INVITES_START_ROW - 1) - 1;
+      if (count > 0) {
+        const range = sh.getRange(2, 15, count, 1);
+        const colO = range.getValues().map(r => String(r[0]||'').trim());
+        const toSet = colO.map(v => (v ? [v] : ['N/A']));
+        range.setValues(toSet);
+      }
+    }
+
+    const hdr = sh.getRange(1,1,1, Math.max(16, sh.getLastColumn())).getValues()[0].map(String);
+    const idx = name => hdr.findIndex(h => _norm(h) === _norm(name)) + 1;
+
+    const nameCol     = idx('Employee Name');
+    const startCol    = idx('Start Date');
+    const endCol      = idx('End Date');
+    const statusCol   = idx('Status');
+    const approverCol = idx('Approver Email');
+    const eventIdCol  = idx('Calendar Event ID');
+
+    const rows     = lastRow - 1;
+    const names    = sh.getRange(2, nameCol, rows, 1).getDisplayValues().flat();
+    const starts   = sh.getRange(2, startCol, rows, 1).getValues().flat();
+    const ends     = sh.getRange(2, endCol, rows, 1).getValues().flat();
+    const statuses = sh.getRange(2, statusCol, rows, 1).getDisplayValues().flat();
+    const approv   = sh.getRange(2, approverCol, rows, 1).getDisplayValues().flat();
+    const evIds    = sh.getRange(2, eventIdCol, rows, 1).getDisplayValues().flat();
+
+    // helpers used for change detection
+    function ymd(obj, fallbackTz) {
+      if (!obj) return '';
+      if (obj.date) return String(obj.date).trim();
+      if (obj.dateTime) {
+        const tz = (obj.timeZone || fallbackTz || Session.getScriptTimeZone());
+        const dt = new Date(String(obj.dateTime));
+        return Utilities.formatDate(dt, tz, 'yyyy-MM-dd');
+      }
+      return '';
+    }
+    function attSet(list) {
+      const s = new Set();
+      (list || []).forEach(a => {
+        const e = String(a && a.email || '').trim().toLowerCase();
+        if (e) s.add(e);
+      });
+      return s;
+    }
+
+    for (let i = 0; i < rows; i++) {
+      const row = i + 2;
+      if (row < INVITES_START_ROW) continue;
+
+      const status    = String(statuses[i] || '').toLowerCase();
+      const name      = names[i] || '';
+      const start     = parseDate(starts[i]);
+      const end       = parseDate(ends[i]);
+      const attendee  = String(approv[i] || '').trim().toLowerCase(); // normalize
+      const existingId= String(evIds[i] || '').trim();
+
+      if (existingId === 'N/A') continue;
+      if (!name || isNaN(start) || isNaN(end)) continue;
+
+      // all-day event: end is exclusive in Calendar API
+      const endPlus1 = new Date(end); endPlus1.setDate(endPlus1.getDate() + 1);
+      const desired = {
+        summary: `${name} Away`,
+        start: { date: _asYMD(start) },
+        end:   { date: _asYMD(endPlus1) },
+        transparency: 'transparent',
+        attendees: attendee ? [{ email: attendee }] : []
+      };
+
+      // remove events for non-approved rows
+      if (status !== 'approved') {
+        if (existingId) {
+          try {
+            Calendar.Events.remove(CALENDAR_ID, existingId, { sendUpdates: 'none' });
+            _logCalendar({ action: 'DELETE', row, eventId: existingId, summary: desired.summary, sendUpdates: 'none' });
+          } catch (e) {
+            _logCalendar({ action: 'DELETE_FAIL', row, eventId: existingId, summary: desired.summary, sendUpdates: 'none', extra: String(e) });
+          }
+          sh.getRange(row, eventIdCol).clearContent();
+        }
+        continue;
+      }
+
+      // create if missing
+      if (!existingId) {
+        try {
+          const created = Calendar.Events.insert(desired, CALENDAR_ID, { sendUpdates: 'all' });
+          sh.getRange(row, eventIdCol).setValue(created.id);
+          _logCalendar({ action: 'CREATE', row, eventId: created.id, summary: desired.summary, sendUpdates: 'all' });
+        } catch (e) {
+          _logCalendar({ action: 'CREATE_FAIL', row, eventId: '', summary: desired.summary, sendUpdates: 'all', extra: String(e) });
+        }
+        continue;
+      }
+
+      // update if changed
+      const existing = _getEventIfExists_(existingId);
+      if (!existing) {
+        // could be truly missing or a 404; recreate
+        try {
+          const created = Calendar.Events.insert(desired, CALENDAR_ID, { sendUpdates: 'all' });
+          sh.getRange(row, eventIdCol).setValue(created.id);
+          _logCalendar({ action: 'RECREATE', row, eventId: created.id, summary: desired.summary, sendUpdates: 'all', extra: 'previous missing' });
+        } catch (e) {
+          _logCalendar({ action: 'CREATE_FAIL', row, eventId: '', summary: desired.summary, sendUpdates: 'all', extra: String(e) });
+        }
+        continue;
+      }
+
+      if (_eventsEqual_(existing, desired)) continue;
+
+      // choose notification level only when material fields changed
+      const exAtt = attSet(existing.attendees);
+      const deAtt = attSet(desired.attendees);
+      const attendeesChanged = exAtt.size !== deAtt.size || [...exAtt].some(e => !deAtt.has(e));
+      const startChanged = ymd(existing.start, existing.start && existing.start.timeZone) !== ymd(desired.start, desired.start && desired.start.timeZone);
+      const endChanged   = ymd(existing.end,   existing.end   && existing.end.timeZone)   !== ymd(desired.end,   desired.end   && desired.end.timeZone);
+      const titleChanged = String(existing.summary||'').trim() !== String(desired.summary||'').trim();
+
+      const opts = { sendUpdates: (attendeesChanged || startChanged || endChanged || titleChanged) ? 'all' : 'none' };
+
+      try {
+        Calendar.Events.patch(desired, CALENDAR_ID, existingId, opts);
+        _logCalendar({ action: 'PATCH', row, eventId: existingId, summary: desired.summary, sendUpdates: opts.sendUpdates });
+      } catch (e) {
+        _logCalendar({ action: 'PATCH_FAIL', row, eventId: existingId, summary: desired.summary, sendUpdates: opts.sendUpdates, extra: String(e) });
+      }
+    }
+  } finally {
+    try { lock.releaseLock(); } catch (_e) {}
+  }
+}
+
+/************************** INSTANT WEBHOOK UPSERT **************************/
+// NEW: shared token getter
+function _getToken_() {
+  const t = (PropertiesService.getScriptProperties().getProperty(HUMI.TOKEN_PROP) || '').trim();
+  if (!t) throw new Error('Missing HUMI_TOKEN');
+  return t;
+}
+
+// NEW: Fetch exactly one employee by ID and upsert now
+function upsertEmployeeByIdNow(empId) {
+  if (!empId) return { ok: false, reason: 'no id' };
+  const token = _getToken_();
+  const url = HUMI.BASE + '/v1/employees/' + encodeURIComponent(empId);
+  const { code, json, text } = _fetchWithRetries_(url, token);
+  if (code !== 200 || !json || !json.data) return { ok:false, reason:'fetch one failed', code, text };
+
+  _upsertOneEmployeeRow_(json.data); // writes the row using robust mapper
+  return { ok:true, id: empId };
+    } 
+
+// NEW: Fallback—upsert by email (lightweight first page search)
+function upsertEmployeeByEmailNow(email) {
+  const token = _getToken_();
+  const { code, json } = _fetchWithRetries_(HUMI.BASE + '/v1/employees?filter[status]=all&page[size]=25&page[number]=1', token);
+  if (code !== 200 || !json || !Array.isArray(json.data)) return { ok:false, reason:'list failed' };
+  const want = String(email || '').trim().toLowerCase();
+  const hit = json.data.find(it => String((it.attributes || {}).email || '').trim().toLowerCase() === want);
+  if (!hit) return { ok:false, reason:'email not found' };
+  _upsertOneEmployeeRow_(hit);
+  return { ok:true, email: email };
+}
+
+// NEW: Webhook entry—deploy as Web App and point Humi/Zapier to POST here
+function doPost(e) {
+  try {
+    const expected = (PropertiesService.getScriptProperties().getProperty(HUMI.WEBHOOK_SECRET_PROP) || '').trim();
+    const got = String(
+      (e.parameter && e.parameter.secret) ||
+      (e.headers && (e.headers['X-Humi-Webhook-Secret'] || e.headers['x-humi-webhook-secret'] ||
+                     e.headers['X-Webhook-Secret'] || e.headers['x-webhook-secret'])) || ''
+    ).trim();
+    if (expected && got && expected !== got) throw new Error('bad webhook secret');
+
+    const body = e.postData && e.postData.contents ? JSON.parse(e.postData.contents) : {};
+    const data = body.data || {};
+    const attrs = data.attributes || {};
+
+    const empId =
+      data.id ||
+      attrs.employee_id || attrs.id ||
+      (body.employee && (body.employee.id || body.employee.employee_id)) || '';
+
+    const email = attrs.email || (body.employee && body.employee.email) || '';
+
+    let res = null;
+    if (empId) res = upsertEmployeeByIdNow(empId);
+    else if (email) res = upsertEmployeeByEmailNow(email);
+    else res = { ok:false, reason:'no id or email' };
+
+    return ContentService.createTextOutput(JSON.stringify({ ok: !!(res && res.ok), result: res }))
+      .setMimeType(ContentService.MimeType.JSON);
   } catch (err) {
-    Logger.log('exclude ' + reason + ' ' + (line.description || ''));
+    return ContentService.createTextOutput(JSON.stringify({ ok:false, error:String(err) }))
+      .setMimeType(ContentService.MimeType.JSON);
   }
 }
 
-function norm(s){ return s ? s.toString().toLowerCase().replace(/\s+/g,' ').trim() : ''; }
-function headerMap(headers){ const map={}; headers.forEach((h,i)=>{ const k=norm(h); if(k) map[k]=i; }); return map; }
-function idx(H, ...names){ for(const n of names){ const k=norm(n); if(k in H) return H[k]; } return -1; }
-
-function normalizeRow(r, H) {
-  const get = (...names) => { const i = idx(H, ...names); return i === -1 ? '' : r[i]; };
-  const num = v => parseNumber(v);
-  const pct = v => parsePercent(v);
-  const str = v => (v || '').toString().trim();
-
-  return {
-    estimator: str(get('estimator')),
-    taxCategory: str(get('tax category')),
-    vendor: str(get('vendor name')),
-    projectTask: str(get('project task')),
-    costAccountGroup: str(get('cost account group','cost account')),
-    costCode: str(get('cost code')),
-    description: str(get('description')),
-    quantity: num(get('quantity')),
-    uom: str(get('uom')),
-    unitCost: num(get('unit cost')),
-    unitPrice: num(get('unit price')),
-    extCost: num(get('ext. cost','ext cost')),
-    extPrice: num(get('ext. price','ext price')),
-    discountPct: pct(get('discount (%)','discount %')),
-    discountAmount: num(get('discount amount','discount am','discount amt')),
-    amount: num(get('amount')),
-    revenueAccountGroup: str(get('revenue account group','revenue acc')),
-    inventoryId: str(get('inventory id'))
-  };
-}
-
-function makeEmptyTask(task, division, description) {
-  return {
-    task,
-    description,
-    division: division || 'Construction',
-    labour:   { qty:0, unitCost:0, unitPrice:0, cost:0, price:0, discount:0, profit:0, margin:0, markup:0 },
-    material: { qty:0, unitCost:0, unitPrice:0, cost:0, price:0, discount:0, profit:0, margin:0, markup:0 },
-    other:    { qty:0, unitCost:0, unitPrice:0, cost:0, price:0, discount:0, profit:0, margin:0, markup:0 },
-    cost:0, price:0, discount:0, profit:0, margin:0, markup:0
-  };
-}
-
-function makeEmptyDiv(name) {
-  return {
-    name,
-    cost:0, price:0, discount:0, profit:0, margin:0, markup:0,
-    labourCost:0, materialCost:0, labourPrice:0, materialPrice:0,
-    labourCostRates:[], labourSellRates:[]
-  };
-}
-
-function divisionFromCostCode(code) {
-  if (!code) return 'Construction';
-  const m = code.toString().match(/^(\d{2})/);
-  const two = m ? m[1] : '';
-  switch (two) {
-    case '26': return 'Electrical';
-    case '23': return 'HVAC';
-    case '22': return 'Plumbing';
-    case '21': return 'Sprinklers';
-    default:   return 'Construction';
+/************************** DEBUG HELPERS **************************/
+function debugProbeLatestEmployees(limit) {
+  if (!limit || limit < 1) limit = 25;
+  const token = (PropertiesService.getScriptProperties().getProperty(HUMI.TOKEN_PROP) || '').trim();
+  if (!token) throw new Error('Missing HUMI_TOKEN');
+  const PAGE = 25;
+  let page = 1, collected = [];
+  while (collected.length < limit) {
+    const url = HUMI.BASE + '/v1/employees?filter[status]=all&sort=-updated_at&page[size]=' + PAGE + '&page[number]=' + page;
+    const { code, json, text } = _fetchWithRetries_(url, token);
+    if (code !== 200) throw new Error('Employees ' + code + ': ' + text);
+    const items = Array.isArray(json && json.data) ? json.data : [];
+    if (!items.length) break;
+    collected = collected.concat(items);
+    if (items.length < PAGE) break;
+    page += 1;
+    Utilities.sleep(120);
   }
+  const names = collected.slice(0, limit).map(it => {
+    const a = it.attributes || {};
+    return [a.first_name || '', a.last_name || ''].join(' ').trim();
+  });
+  Logger.log('Newest (top %s by updated_at): %s', Math.min(limit, collected.length), names.join(', '));
+}
+function _fetchAllEmployees_() {
+  const token = (PropertiesService.getScriptProperties().getProperty(HUMI.TOKEN_PROP) || '').trim();
+  if (!token) throw new Error('Missing HUMI_TOKEN');
+  const headers = { Authorization: 'Bearer ' + token, Accept: 'application/vnd.api+json' };
+  const PAGE = 25; let page = 1, all = [];
+  while (true) {
+    const url = HUMI.BASE + '/v1/employees?filter[status]=all&page[size]=' + PAGE + '&page[number]=' + page;
+    const resp = UrlFetchApp.fetch(url, { method: 'get', muteHttpExceptions: true, headers });
+    const code = resp.getResponseCode();
+    if (code !== 200) throw new Error('Employees ' + code + ': ' + resp.getContentText());
+    const json = JSON.parse(resp.getContentText() || '{}');
+    const items = Array.isArray(json && json.data) ? json.data : [];
+    if (!items.length) break;
+    all = all.concat(items);
+    if (items.length < PAGE) break;
+    page += 1;
+    Utilities.sleep(120);
+  }
+  return all;
+}
+function debugFindEmployee(q) {
+  const all = _fetchAllEmployees_();
+  const norm = s => String(s||'').trim().toLowerCase();
+  const wantName = norm(q.fullName || '');
+  const wantEmail = norm(q.email || '');
+  const wantFirst = norm(q.first || '');
+  const wantLast  = norm(q.last || '');
+  const hits = all.filter(it => {
+    const a = it.attributes || {};
+    const fn = norm(a.first_name);
+    const ln = norm(a.last_name);
+    const full = (fn + ' ' + ln).trim();
+    const em = norm(a.email);
+    const nameOk  = wantName ? (full === wantName) : ( (!wantFirst || fn === wantFirst) && (!wantLast || ln === wantLast) );
+    const emailOk = wantEmail ? (em === wantEmail) : true;
+    return nameOk && emailOk;
+  });
+  Logger.log('Found %s match(es): %s', hits.length,
+    hits.map(it => {
+      const a = it.attributes || {};
+      return [a.first_name, a.last_name, '<' + (a.email||'') + '>', 'start:', a.start_date || '', 'status?', a.end_date ? 'terminated' : 'active'].join(' ');
+    }).join(' | ')
+  );
+}
+function debugEmployeesHealthCheck() {
+  const all = _fetchAllEmployees_();
+  const norm = s => String(s||'').trim().toLowerCase();
+  const names = all.map(it => {
+    const a = it.attributes || {};
+    return { full: `${a.first_name||''} ${a.last_name||''}`.trim(), email: a.email||'' };
+  });
+  const want = ['Katlynn Allen', 'Francisco Ayesta'];
+  Logger.log('API returned %s employees.', all.length);
+  want.forEach(n => {
+    const present = names.some(x => norm(x.full) === norm(n));
+    Logger.log('%s present? %s', n, present ? 'YES' : 'NO');
+  });
+  Logger.log('First 5:  %s', names.slice(0,5).map(x=>x.full).join(', '));
+  Logger.log('Last 5:   %s', names.slice(-5).map(x=>x.full).join(', '));
 }
 
-function pickMode(arr) {
-  if (!arr || !arr.length) return {mode: 0, multiple: false, all: []};
-  const freq = {};
-  arr.forEach(v => { freq[v] = (freq[v] || 0) + 1; });
-  let mode = Number(arr[0]), max = 0;
-  Object.keys(freq).forEach(k => { if (freq[k] > max) { max = freq[k]; mode = Number(k); } });
-  const unique = Object.keys(freq).map(Number).sort((a,b)=>a-b);
-  return {mode, multiple: unique.length > 1, all: unique};
-}
-
-function safeDiv(a,b){ return b ? a/b : 0; }
-function nonZero(v){ return v !== null && v !== '' && v !== 0; }
-function computePMM(obj){ obj.profit=(obj.price||0)-(obj.cost||0)-(obj.discount||0); obj.margin=safeDiv(obj.profit,(obj.price||0)); obj.markup=safeDiv(obj.profit,(obj.cost||0)); }
-function pushUnique(arr, val) { if (val !== undefined && val !== null && !arr.includes(val)) arr.push(val); }
-function round2(v){ return Math.round((Number(v) || 0) * 100) / 100; }
-function formatDate(d){ return Utilities.formatDate(d, SET.tz, SET.dateFmt); }
-
-/* ===== Version helpers (keyed by Opportunity #, start at 0) ===== */
-
-// Persist map: { "<opportunityNumber>": <lastVersionUsed> }
-const VERSION_PROP = 'QUOTE_VERSIONS_BY_OPP';
-
-function getNextVersion_(inputs) {
-  const dp = PropertiesService.getDocumentProperties();
-
-  let map;
-  try { map = JSON.parse(dp.getProperty(VERSION_PROP) || '{}'); }
-  catch (e) { map = {}; }
-
-  const key = (inputs.opportunityNumber || '').toString().trim();
-  if (!key) throw new Error('Opportunity number is required for versioning.');
-
-  const current = Number(map[key]);
-  const next = Number.isFinite(current) ? (current + 1) : 0;
-
-  map[key] = next;
-  dp.setProperty(VERSION_PROP, JSON.stringify(map));
-  return next;
-}
-
-// Validate required fields on server (address optional)
-function validateInputs_(f){
-  const clean = (x) => (x || '').toString().trim();
-  const out = {
-    customerName:      clean(f.customerName),
-    customerAddress:   clean(f.customerAddress), // optional
-    opportunityNumber: clean(f.opportunityNumber),
-    estimateName:      clean(f.estimateName),
-  };
-  if (!out.customerName || !out.opportunityNumber || !out.estimateName) {
-    throw new Error('Customer name, Opportunity number, and Estimate name are required.');
+/******************** TARGETED DIAGNOSTIC AND ONE OFF UPSERTS ********************/
+function _fetchAllEmployees_Once_() {
+  const token = (PropertiesService.getScriptProperties().getProperty(HUMI.TOKEN_PROP) || '').trim();
+  if (!token) throw new Error('Missing HUMI_TOKEN');
+  const headers = { Authorization: 'Bearer ' + token, Accept: 'application/vnd.api+json' };
+  const PAGE = 25;
+  let page = 1, out = [];
+  while (true) {
+    const url = HUMI.BASE + '/v1/employees?filter[status]=all&page[size]=' + PAGE + '&page[number]=' + page;
+    const resp = UrlFetchApp.fetch(url, { method: 'get', muteHttpExceptions: true, headers });
+    const code = resp.getResponseCode();
+    if (code !== 200) throw new Error('Employees ' + code + ': ' + resp.getContentText());
+    const json = JSON.parse(resp.getContentText() || '{}');
+    const items = Array.isArray(json && json.data) ? json.data : [];
+    if (!items.length) break;
+    out = out.concat(items);
+    if (items.length < PAGE) break;
+    page += 1;
+    Utilities.sleep(120);
   }
   return out;
+}
+
+function _empEnsureHeaders_() {
+  const sh = _getSheet(HUMI.TAB_EMP);
+  const base   = ['ID','First Name','Last Name','Email','Department','Position',
+                  'Employment Type','Start Date','End Date','Full Name','Status'];
+  const extras = ['Legal First Name','Legal Last Name','Work Phone','Mobile Phone',
+                  'Office','Reports To ID','Created At','Updated At'];
+  const want   = base.concat(extras);
+
+  const lastCol = Math.max(want.length, sh.getLastColumn());
+  const hdr = (lastCol ? sh.getRange(1,1,1,lastCol).getValues()[0] : []);
+  if (!hdr.length) {
+    sh.getRange(1,1,1,want.length).setValues([want]);
+    sh.setFrozenRows(1);
+  } else {
+    for (let i=0; i<want.length; i++) sh.getRange(1,i+1).setValue(want[i]);
+    if (sh.getFrozenRows() < 1) sh.setFrozenRows(1);
+  }
+  const col={}; want.forEach((h,i)=>col[h]=i+1);
+  return { sh, col, want };
+}
+
+function _rowFromEmployee_(it) {
+  const a = it.attributes || {};
+  const first = a.first_name || '';
+  const last  = a.last_name  || '';
+  const email = a.email      || '';
+  const dept  = a.department || '';
+  const pos   = a.position   || '';
+  const empT  = a.employment_type || '';
+  const start = _asYMD(a.start_date || '');
+  // NEW: robust end-date mapping
+  const rawEnd = _firstNonEmpty(a.end_date, a.termination_date, a.terminated_at, a.employment_end_date);
+  const end   = _asYMD(rawEnd || '');
+  const statusRaw = String(a.status || a.employment_status || a.employee_status || '').trim().toLowerCase();
+  const status = end ? 'terminated' : (statusRaw ? statusRaw : 'active');
+  const full  = [first,last].filter(Boolean).join(' ');
+  return [
+    it.id || a.id || '', first, last, email, dept, pos, empT,
+    start, end, full, status,
+    a.legal_first_name || '', a.legal_last_name || '',
+    a.work_phone || '', a.mobile_phone || '',
+    a.office || '', a.reports_to_id || '',
+    a.created_at || '', a.updated_at || ''
+  ];
+}
+
+/** Upsert exactly one employee record by ID or Email */
+function _upsertOneEmployeeRow_(emp) {
+  const a = emp.attributes || {};
+  const id = String(emp.id || a.id || '').trim();
+  const emailKey = String(a.email || '').trim().toLowerCase();
+
+  const { sh, col, want } = _empEnsureHeaders_();
+
+  // index existing
+  const lastRow = sh.getLastRow();
+  const rows = Math.max(0, lastRow - 1);
+  const idToRow = new Map();
+  const emailToRow = new Map();
+  const sheetIdsByRow = [];
+  if (rows) {
+    const ids    = sh.getRange(2, col['ID'],    rows, 1).getDisplayValues().flat();
+    const emails = sh.getRange(2, col['Email'], rows, 1).getDisplayValues().flat();
+    ids.forEach((v,i)=>{
+      const k = String(v || '').trim();
+      sheetIdsByRow[i] = k;
+      if (k) idToRow.set(k, i+2);
+    });
+
+    emails.forEach((v,i)=>{
+      const k = String(v||'').trim().toLowerCase();
+      if (k) emailToRow.set(k, i+2);
+    });
+  }
+
+  let rowNum = idToRow.get(id);
+  if (!rowNum && emailKey) {
+    const candidate = emailToRow.get(emailKey);
+    if (candidate) {
+      const existingId = sheetIdsByRow[candidate - 2] || '';
+      if (!existingId || existingId === id) {
+        rowNum = candidate;
+      }
+    }
+  }
+  const target = _rowFromEmployee_(emp);
+
+  if (rowNum) {
+    const range = sh.getRange(rowNum, 1, 1, want.length);
+    range.setValues([target]);
+    sheetIdsByRow[rowNum - 2] = id;
+    Logger.log('UPDATED row %s for %s %s', rowNum, a.first_name||'', a.last_name||'');
+  } else {
+    sh.appendRow(target);
+    Logger.log('INSERTED row %s for %s %s', sh.getLastRow(), a.first_name||'', a.last_name||'');
+  }
+}
+
+/** Find by full name and upsert one row */
+function forceUpsertEmployeeByFullName(fullName) {
+  const norm = s => String(s||'').trim().toLowerCase();
+  const want = norm(fullName);
+
+  const all = _fetchAllEmployees_Once_();
+  const hits = all.filter(it => {
+    const a = it.attributes || {};
+    const full = norm((a.first_name||'') + ' ' + (a.last_name||''));
+    return full === want;
+  });
+
+  Logger.log('Found %s match(es) for "%s"', hits.length, fullName);
+  if (!hits.length) return;
+  _upsertOneEmployeeRow_(hits[0]);
+}
+
+/** Find by email and upsert one row */
+function forceUpsertEmployeeByEmail(email) {
+  const want = String(email||'').trim().toLowerCase();
+  const all = _fetchAllEmployees_Once_();
+  const hit = all.find(it => (String((it.attributes||{}).email||'').trim().toLowerCase() === want));
+  Logger.log('Email "%s" %s', email, hit ? 'FOUND' : 'NOT FOUND');
+  if (!hit) return;
+  _upsertOneEmployeeRow_(hit);
+}
+
+/** Quick probe to show an employee record */
+function debugShowEmployee(fullName) {
+  const norm = s => String(s||'').trim().toLowerCase();
+  const want = norm(fullName);
+  const all = _fetchAllEmployees_Once_();
+  const hits = all.filter(it => {
+    const a = it.attributes || {};
+    return norm((a.first_name||'') + ' ' + (a.last_name||'')) === want;
+  });
+  Logger.log('Found %s:', hits.length);
+  hits.forEach(it => Logger.log(JSON.stringify(it.attributes || {}, null, 2)));
+}
+
+function runForceUpsertKatlynn()   { forceUpsertEmployeeByFullName('Heather Sandall'); }
+function runForceUpsertFrancisco() { forceUpsertEmployeeByFullName('Francisco Ayesta'); }
+
+/************************** APPROVER LOOKUP **************************/
+function _computeApproverEmail_(dept) {
+  switch (String(dept || '')) {
+    case 'Service':          return 'servicevacation@meadowb.com';
+    case 'Production':       return 'production@meadowb.com';
+    case 'Estimating':       return 'productionvaca@meadowb.com';
+    case 'Human Resources':  return 'hr@meadowb.com';
+    case 'Sales':            return 'salesvaca@meadowb.com';
+    case 'Glendale':         return 'afeo@glendalegroup.ca';
+    case 'Leadership':       return 'sbuhagiar@meadowb.com';
+    case 'Multimedia':       return 'sbuhagiar@meadowb.com';
+    case 'Accounting':       return 'Csamonte@meadowb.com';
+    case 'Office Support':   return 'officesupport@meadowb.com';
+    default:                 return 'jserrano@meadowb.com';
+  }
+}
+
+/************************** QUICK RUNNERS **************************/
+function run_employee_sync_fast() { return syncHumiEmployees(false); }
+function run_employee_sync_full() { return syncHumiEmployees(true); }
+function run_full_employee_sync() { return syncHumiEmployees(true); }
+
+function run_pull_recent_window() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(LOCK_CFG.TRY_MS)) return { skipped: 'locked' };
+  try {
+    const tz = Session.getScriptTimeZone();
+    const today = new Date();
+    const start = new Date(today); start.setDate(start.getDate() - 90);
+    const end   = new Date(today); end.setDate(end.getDate() + 60);
+    return pullHumiTimeOffAllStatuses(Utilities.formatDate(start,tz,'yyyy-MM-dd'), Utilities.formatDate(end,tz,'yyyy-MM-dd'));
+  } finally { try { lock.releaseLock(); } catch (_e) {} }
+}
+function run_zap_pipeline()       { return processZapierNewTimeOffRows(); }
+function run_calendar_pipeline()  { return syncCalendarInvites(); }
+
+function nightly_full_employee_sync() {
+  // 1) Bulk upsert from the list endpoint (adds new, updates existing, marks deleted)
+  syncHumiEmployees(true);
+  run_verify_all_background();
+
+  // 2) Deterministic correctness pass: read every ID and upsert from /:id
+  //    This guarantees End Date and other attributes are correct.
+  try {
+    const res = verifyAllEmployeesFromSheet();   // or verifyAllEmployeesFromSheet(500) if you want a cap
+    Logger.log('Post-sync verify-all: %s scanned, %s ok, %s fail', res.scanned, res.ok, res.fail);
+  } catch (e) {
+    Logger.log('Post-sync verify-all error: %s', e);
+  }
+}
+
+
+// NEW: Local test shims for webhook
+function simulate_webhook_for_employee_id(empId) { return upsertEmployeeByIdNow(empId); }
+function simulate_webhook_for_email(email) { return upsertEmployeeByEmailNow(email); }
+
+// NEW: Log exact payload for single employee (confirms what Humi returns right now)
+function debugLogEmployeeById(empId) {
+  const token = _getToken_();
+  const url = HUMI.BASE + '/v1/employees/' + encodeURIComponent(empId);
+  const { code, json, text } = _fetchWithRetries_(url, token);
+  Logger.log('GET one code=%s', code);
+  Logger.log('BODY: %s', text);
+  return { code, body: text };
+}
+
+/************************** NIGHTLY TRIGGERS **************************/
+/** Install nightly full sync + repair pass.
+ *  - Full sync at 02:15 local time
+ *  - End-date repair pass at 02:45 local time
+ *  Run this once from the Run menu.
+ */
+function install_nightly_humi_jobs() {
+  // Clean up any duplicates for these handlers first
+  const handlers = new Set(['nightly_full_employee_sync', 'nightly_enddate_repair']);
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (handlers.has(t.getHandlerFunction())) ScriptApp.deleteTrigger(t);
+  });
+
+  // Full sync nightly
+  ScriptApp.newTrigger('nightly_full_employee_sync')
+    .timeBased()
+    .everyDays(1)
+    .atHour(2)          // local time
+    .nearMinute(15)     // ~02:15
+    .create();
+
+  // Repair pass nightly (pulls any missing end dates by ID)
+  ScriptApp.newTrigger('nightly_enddate_repair')
+    .timeBased()
+    .everyDays(1)
+    .atHour(2)          // local time
+    .nearMinute(45)     // ~02:45
+    .create();
+}
+
+/** Remove the nightly triggers if you ever want to change the schedule. */
+function remove_nightly_humi_jobs() {
+  const handlers = new Set(['nightly_full_employee_sync', 'nightly_enddate_repair']);
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (handlers.has(t.getHandlerFunction())) ScriptApp.deleteTrigger(t);
+  });
+}
+
+/** Quick inspection of triggers – logs what’s currently installed. */
+function log_current_triggers() {
+  const tz = Session.getScriptTimeZone();
+  const ts = ScriptApp.getProjectTriggers().map(t => ({
+    id: t.getUniqueId(),
+    fn: t.getHandlerFunction(),
+    type: String(t.getTriggerSource()),
+  }));
+  Logger.log('Timezone: %s', tz);
+  Logger.log('Triggers:\n%s', JSON.stringify(ts, null, 2));
+}
+
+// Build the ID list from the sheet and start/resume the background job
+// Build the ID list from the sheet, kick a first chunk, then let the cron keep running
+function run_verify_all_background() {
+  const { sh, col } = _empEnsureHeaders_();
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) return { started:false, reason:'no rows' };
+
+  // Collect & de-duplicate trimmed IDs (in sheet order)
+  let ids = sh.getRange(2, col['ID'], lastRow - 1, 1)
+              .getDisplayValues()
+              .flat()
+              .map(s => String(s || '').trim())
+              .filter(Boolean);
+  const seen = new Set();
+  ids = ids.filter(id => !seen.has(id) && seen.add(id));
+
+  _verifySetIds_(ids);
+  _verifySetCursor_(0);
+  PropertiesService.getScriptProperties().setProperty(VERIFY_JOB.RUN_ID_PROP, new Date().toISOString());
+
+  // Process the first chunk immediately so you see progress now
+  verify_all_worker();
+
+  // Ensure a repeating every-minute trigger exists to continue in the background
+  ensure_verify_worker_trigger();
+
+  Logger.log('Started verify-all background job for %s IDs', ids.length);
+  return { started:true, total: ids.length };
+}
+
+
+
+// Worker: processes one chunk, reschedules itself as needed
+function verify_all_worker() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(8000)) return { skipped: 'locked' };
+  try {
+    const ids = _verifyGetIds_();
+    if (!ids.length) return { done: true, reason: 'no ids queued' };
+
+    let cursor = _verifyGetCursor_();
+    if (cursor >= ids.length) { _verifyClearState_(); return { done:true, total: ids.length }; }
+
+    const startTs = Date.now();
+    const stopAt  = startTs + VERIFY_JOB.BUDGET_MS;
+    const endIdx  = Math.min(ids.length, cursor + VERIFY_JOB.CHUNK);
+
+    let ok = 0, fail = 0;
+    for (; cursor < endIdx; cursor++) {
+      const id = ids[cursor];
+      const res = upsertEmployeeByIdNow(id);
+      if (res && res.ok) ok++; else fail++;
+      Utilities.sleep(VERIFY_JOB.DELAY_MS);
+      if (Date.now() >= stopAt) { cursor++; break; }  // leave loop early before timeout
+    }
+
+    _verifySetCursor_(cursor);
+
+    // progress log row
+    _logRow_(
+      HUMI.TAB_LOG_EMP,
+      ['Timestamp','Action','ID','Field','Old','New'],
+      [new Date().toISOString(), 'VERIFY_CHUNK', `${ok} ok / ${fail} fail`, 'cursor', '', `${cursor}/${ids.length}`],
+      true
+    );
+
+    if (cursor < ids.length) {
+      // The repeating cron (every minute) will call us again.
+      return { continued:true, cursor, remaining: ids.length - cursor, ok, fail };
+    } else {
+      _verifyClearState_();
+      disable_verify_worker_trigger(); // turn off the cron now that we are finished
+      _logRow_(
+        HUMI.TAB_LOG_EMP,
+        ['Timestamp','Action','ID','Field','Old','New'],
+        [new Date().toISOString(), 'VERIFY_DONE', '', 'total', '', String(ids.length)],
+        true
+      );
+      return { done:true, total: ids.length };
+    }
+  } finally { try { lock.releaseLock(); } catch (_e) {} }
+}
+
+// Optional helpers
+function cancel_verify_all_jobs() {
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === 'verify_all_worker') ScriptApp.deleteTrigger(t);
+  });
+  _verifyClearState_();
+  return { cancelled:true };
+}
+function show_verify_status() {
+  const ids = _verifyGetIds_();
+  const cur = _verifyGetCursor_();
+  const running = ScriptApp.getProjectTriggers()
+    .some(t => t.getHandlerFunction() === 'verify_all_worker');
+
+  const out = {
+    total: ids.length,
+    cursor: cur,
+    remaining: Math.max(0, ids.length - cur),
+    running
+  };
+
+  // Log to execution log
+  Logger.log('verify status: %s', JSON.stringify(out, null, 2));
+
+  // Also write a row to the Humi Employee Sync Log so you can see it in the sheet
+  _logRow_(
+    HUMI.TAB_LOG_EMP,
+    ['Timestamp','Action','ID','Field','Old','New'],
+    [new Date().toISOString(), 'VERIFY_STATUS', '', '', '', JSON.stringify(out)],
+    true
+  );
+  return out;
+} 
+
+
+function verify_all_worker_now() {
+  return verify_all_worker();
+}
+
+function debug_verify_queue() {
+  const ids = _verifyGetIds_();
+  const cur = _verifyGetCursor_();
+  Logger.log('verify queue: total=%s cursor=%s remaining=%s',
+             ids.length, cur, Math.max(0, ids.length - cur));
+}
+
+function install_continuous_employee_sync() {
+  // remove any prior trigger for this handler
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === 'run_employee_sync_fast') ScriptApp.deleteTrigger(t);
+  });
+  ScriptApp.newTrigger('run_employee_sync_fast') // calls syncHumiEmployees(false)
+    .timeBased()
+    .everyMinutes(15)
+    .create();
+}
+function remove_continuous_employee_sync() {
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === 'run_employee_sync_fast') ScriptApp.deleteTrigger(t);
+  });
 }
