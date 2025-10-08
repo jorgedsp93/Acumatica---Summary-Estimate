@@ -11,7 +11,7 @@
  * - Rebuild Summary safely: remove banding & CF first
  * - Notes/Warranty/Exclusions footer; Exclusions sentence‑cased & trimmed
  * - Project Tasks CSV dates = today (yyyy-MM-dd)
- * - Estimation CSV outputs L / MQ / S lines; Cost Code forced as text (=“code”)
+ * - Estimation CSV outputs L / MQ / S lines; Cost Code exported as text; Tax Category forced to 'H'
  * - HVAC & Electrical templates seeded from data you provided
  * =========================================================== */
 
@@ -220,7 +220,7 @@ function templateOptions(div){
     case 'PLU': return ['No Template','Plumbing'];
     case 'MEC': return ['No Template','HVAC'];
     case 'ELE': return ['No Template','Electrical'];
-    case 'CON': return ['No Template','Construction'];
+    case 'CON': return ['No Template'].concat(CONSTRUCTION_TEMPLATES.map(t => t.name));
     default:    return ['No Template'];
   }
 }
@@ -275,17 +275,43 @@ function onEdit(e){
 
     // Template picker at B8
     if (e.range.getA1Notation() === 'B8'){
-      const v = String(e.range.getValue()||'').trim().toLowerCase();
+      const rawPick = String(e.range.getValue()||'').trim();
+      const v = rawPick.toLowerCase();
       if (v === 'no template'){
         clearDivisionInputs(div);
         sh.getRange('D8').setValue('Last loaded: ' + new Date());
-      } else if (
-        (v === 'plumbing'   && div.key === 'PLU') ||
-        (v === 'hvac'       && div.key === 'MEC') ||
-        (v === 'electrical' && div.key === 'ELE') ||
-        (v === 'construction' && div.key === 'CON')
-      ){
-        Load_From_Template_For_Div(div);
+        return;
+      }
+
+      if (div.key === 'PLU' && v === 'plumbing'){
+        Load_From_Template_For_Div(div, { templateName: 'Plumbing' });
+        return;
+      }
+      if (div.key === 'MEC' && v === 'hvac'){
+        Load_From_Template_For_Div(div, { templateName: 'HVAC' });
+        return;
+      }
+      if (div.key === 'ELE' && v === 'electrical'){
+        Load_From_Template_For_Div(div, { templateName: 'Electrical' });
+        return;
+      }
+      if (div.key === 'CON'){
+        const tpl = findConstructionTemplateByName(rawPick);
+        if (tpl){
+          applyConstructionTemplateToSheet(tpl);
+          Load_From_Template_For_Div(div, { templateName: tpl.name });
+          return;
+        }
+        if (v === 'construction'){ // legacy label support
+          const fallback = CONSTRUCTION_TEMPLATES[0];
+          if (fallback){
+            applyConstructionTemplateToSheet(fallback);
+            Load_From_Template_For_Div(div, { templateName: fallback.name });
+          } else {
+            Load_From_Template_For_Div(div);
+          }
+          return;
+        }
       }
       return;
     }
@@ -342,7 +368,7 @@ function Setup_Once(){
   seedPlumbingTemplate();
   seedElectricalTemplate();  // new
   seedHVACTemplate();        // new
-  seedEmptyTemplateSheet(S_TPL_C);
+  seedConstructionTemplates();
   seedSourceSheets();
 
   // Default template pickers
@@ -641,8 +667,8 @@ function buildPricingBookSheet(){
   sh.getRange('C27').setFormula('=IF($B$7="","",$B$7)').setNumberFormat('0.00');
   sh.getRange('C28').setFormula('=IF(C27="",1,IF(C27<2,1,IF(AND(C27>=2.1,C27<=4),1.15,IF(AND(C27>4,C27<=6),1.25,IF(AND(C27>6,C27<=10),1.4,1)))))').setNumberFormat('0.00');
   sh.getRange('C29').setFormula('=IF($B$8="",0,$B$8*0.05)').setNumberFormat('0.0%');
-  sh.getRange('C30').setFormula('=IF(OR(C25="",C28=""),0,ROUND((C25/1000)*C26*C28,3))').setNumberFormat('0.000');
-  sh.getRange('C31').setFormula('=IF(C30=0,0,ROUND(C30*(1+C29),3))').setNumberFormat('0.000');
+  sh.getRange('C30').setFormula('=IF(OR(C26="",C28=""),0,ROUND(C26*C28,3))').setNumberFormat('0.000');
+  sh.getRange('C31').setFormula('=IF(C30=0,0,ROUND(C30*(1+$B$8*0.05),3))').setNumberFormat('0.000');
   sh.getRange('C32').setValue(85).setNumberFormat('$#,##0.00');
   sh.getRange('C33').setFormula('=IF(C31=0,0,ROUND(C31*C32,2))').setNumberFormat('$#,##0.00');
 
@@ -1073,7 +1099,7 @@ function Load_Plumbing_From_Template(){
   applyDescInvalidHighlight_(sh, div);
 }
 
-function Load_From_Template_For_Div(div){
+function Load_From_Template_For_Div(div, opts){
   const tplName = getTemplateSheetForDivision_(div);
   const tpl = SpreadsheetApp.getActive().getSheetByName(tplName);
   if (!tpl || tpl.getLastRow() < 2){
@@ -1081,7 +1107,8 @@ function Load_From_Template_For_Div(div){
     return;
   }
 
-  const data = tpl.getRange(2,1, tpl.getLastRow()-1, 11).getValues(); // A..K
+  let data = tpl.getRange(2,1, tpl.getLastRow()-1, 11).getValues(); // A..K
+  if (div.key === 'MEC') data = sortRowsByCostCode_(data);
   const sh   = SpreadsheetApp.getActive().getSheetByName(div.sheet);
   const L    = layout(div);
 
@@ -1101,7 +1128,8 @@ function Load_From_Template_For_Div(div){
     if (costRate !== '' && costRate != null) sh.getRange(L.data+i, COL.COST_RATE_HR).setValue(Number(costRate)||0);
   }
 
-  sh.getRange('D8').setValue('Last loaded: ' + new Date());
+  const tag = opts && opts.templateName ? ' (' + opts.templateName + ')' : '';
+  sh.getRange('D8').setValue('Last loaded: ' + new Date() + tag);
   applyTaskValidationToSheet_(sh, div);   // Description dropdowns (col D)
   ensureMirrorList_(sh, div);             // CF local list
   applyDescInvalidHighlight_(sh, div);
@@ -1130,17 +1158,12 @@ function applyTaskValidationToSheet_(sh, div){
   const L = layout(div);
   sh.getRange(L.data, COL.DESC, div.lines, 1).clearDataValidations();
 
-  const tplName = getTemplateSheetForDivision_(div);
-  if (!tplName) return;
+  const { descriptions } = uniqueDescriptionsForDivision_(div);
+  if (!descriptions.length) return;
 
-  const tpl = SpreadsheetApp.getActive().getSheetByName(tplName);
-  if (!tpl) return;
-
-  const maxRow = Math.max(tpl.getLastRow(), 10000);
-  const listRange = tpl.getRange(2,4,Math.max(maxRow-1,1),1); // D2:D Description
   const dv = SpreadsheetApp.newDataValidation()
-    .requireValueInRange(listRange, true)
-    .setAllowInvalid(false) // hard block outside values
+    .requireValueInList(descriptions, true)
+    .setAllowInvalid(false)
     .setHelpText('Pick an Item by Description.')
     .build();
   sh.getRange(L.data, COL.DESC, div.lines, 1).setDataValidation(dv);
@@ -1148,12 +1171,15 @@ function applyTaskValidationToSheet_(sh, div){
 
 /** Create/refresh the local mirror (hidden col V) of template Descriptions */
 function ensureMirrorList_(sh, div){
-  const tplName = getTemplateSheetForDivision_(div);
-  // Clear old values
-  sh.getRange(2, COL.VAL_LIST, Math.max(0, sh.getMaxRows()-1), 1).clearContent();
-  if (!tplName) { hideHelperCols_(sh); return; }
-  const formula = `=IFERROR(FILTER('${tplName}'!$D$2:$D, LEN('${tplName}'!$D$2:$D)),)`;
-  sh.getRange(2, COL.VAL_LIST).setFormula(formula);
+  const { descriptions } = uniqueDescriptionsForDivision_(div);
+  const totalRows = Math.max(sh.getMaxRows(), 2);
+  if (totalRows < descriptions.length + 1) ensureRows(sh, descriptions.length + 1);
+  const clearCount = Math.max(0, sh.getMaxRows() - 1);
+  if (clearCount > 0) sh.getRange(2, COL.VAL_LIST, clearCount, 1).clearContent();
+  if (descriptions.length){
+    const values = descriptions.map(d=>[d]);
+    sh.getRange(2, COL.VAL_LIST, values.length, 1).setValues(values);
+  }
   hideHelperCols_(sh);
 }
 /** Refresh mirrors for all divisions (called on Setup & template edits) */
@@ -1594,18 +1620,19 @@ function seedPlumbingTemplate(){
 
   // [Task, Cost Code, Sell, Description]
   const items = [
-    ['PDEMO','22-0505',130,'Plumbing demo'],
-    ['PDOWATER','22-1116',130,'Domestic water'],
-    ['PFIXTURES','22-4200',130,'Plumbing fixtures'],
-    ['PGCSUPER','22-0000',140,'GC Plumbing Project supervision'],
-    ['PGENERAL','22-0000',130,'Plumbing General'],
-    ['PPIPEINSU','22-0719',130,'Pipe insulation'],
     ['PRENTALE','01-6030',130,'Rental equipment'],
     ['PROOFING','07-6100',130,'Roofing'],
-    ['PSANPAG','22-1318',130,'San Piping - above grade'],
-    ['PSANPBG','22-1317',130,'San Piping - below grade'],
+    ['PGCSUPER','22-0000',140,'GC Plumbing Project supervision'],
+    ['PGENERAL','22-0000',130,'Plumbing General'],
     ['PSUPERVISI','22-0000',140,'Plumbing Project supervision'],
-    ['PVENTPIP','22-1318',130,'Vent Piping']
+    ['PLUMBINGPM','22-0000',140,'Electrical Project Manager'],
+    ['PDEMO','22-0505',130,'Plumbing demo'],
+    ['PPIPEINSU','22-0719',130,'Pipe insulation'],
+    ['PDOWATER','22-1116',130,'Domestic water'],
+    ['PSANPBG','22-1317',130,'San Piping - below grade'],
+    ['PSANPAG','22-1318',130,'San Piping - above grade'],
+    ['PVENTPIP','22-1318',130,'Vent Piping'],
+    ['PFIXTURES','22-4200',130,'Plumbing fixtures']
   ];
 
   const rows = items.map(([task, code, sell, desc])=>[
@@ -1645,9 +1672,354 @@ function seedHVACTemplate(){
     ['HVACGRAL','23-0000','R','HVAC General','HOUR',140,93,'Cost and Revenue Task','H','',''],
     ['HVACINSU','23-0700','R','HVAC Insulation','HOUR',140,93,'Cost and Revenue Task','H','',''],
     ['HVACPIPI','23-1100','R','HVAC Piping','HOUR',140,93,'Cost and Revenue Task','H','',''],
-    ['HVACTAB', '23-0593','R','HVAC Testing, adjusting, balancing','HOUR',140,93,'Cost and Revenue Task','H','','']
+    ['HVACTAB', '23-0593','R','HVAC Testing, adjusting, balancing','HOUR',140,93,'Cost and Revenue Task','H','',''],
+    ['HVACPM','23-0000','R','Electrical Project Manager','HOUR',140,85,'Cost and Revenue Task','H','','']
   ];
   sh.getRange(2,1,rows.length,rows[0].length).setValues(rows);
+}
+
+const CONSTRUCTION_TEMPLATE_HEADER = [
+  'Project Task','Cost Code','Account Group','Description','UOM',
+  'Sell Rate $/Hr','Cost Rate $/Hr','Type','Tax Category','Default Planned Start','Default Planned End'
+];
+const CONSTRUCTION_TEMPLATE_DEFAULTS = {
+  accountGroup: 'R',
+  type: 'Cost and Revenue Task',
+  tax: 'H'
+};
+
+const CONSTRUCTION_TEMPLATES = [
+  {
+    key: 'office-washroom',
+    name: 'Office & Washroom',
+    items: [
+      { task:'ProjectMan',  costCode:'01-1010', desc:'ProjectManager',                 uom:'Each', sell:140, cost:93 },
+      { task:'Sitesuperv',  costCode:'01-1020', desc:'Site supervision',               uom:'Each', sell:140, cost:93 },
+      { task:'GCSitesupe',  costCode:'01-1025', desc:'GC Site supervision',            uom:'Each', sell:140, cost:93 },
+      { task:'Coordinato',  costCode:'01-1050', desc:'Coordinator',                    uom:'Each', sell:130, cost:85 },
+      { task:'CloseAsBui',  costCode:'64-1060', desc:'Close-out/AsBuilts',             uom:'Each', sell:130, cost:85 },
+      { task:'Trailers',    costCode:'01-3210', desc:'Trailers',                       uom:'Each', sell:130, cost:85 },
+      { task:'Portablewa',  costCode:'01-3230', desc:'Portable washroom',              uom:'Each', sell:130, cost:85 },
+      { task:'Tarping',     costCode:'01-5600', desc:'Tarping',                        uom:'Each', sell:130, cost:85 },
+      { task:'Hoarding',    costCode:'01-5610', desc:'Hoarding',                       uom:'Each', sell:130, cost:85 },
+      { task:'Siteprep',    costCode:'02-4000', desc:'Site preparations',              uom:'Each', sell:130, cost:85 },
+      { task:'Floorprote',  costCode:'02-4010', desc:'Floor protection',               uom:'Each', sell:130, cost:85 },
+      { task:'Demolition',  costCode:'02-4100', desc:'Demolition',                     uom:'Each', sell:130, cost:85 },
+      { task:'Concscann',   costCode:'02-4116', desc:'Concrete scanning',              uom:'Each', sell:130, cost:85 },
+      { task:'Trenching',   costCode:'31-2333', desc:'Trenching',                      uom:'Each', sell:130, cost:85 },
+      { task:'GBWallFram',  costCode:'09-2240', desc:'GB Wall Framing',                uom:'SQFT', sell:130, cost:85 },
+      { task:'GBWallBoar',  costCode:'09-2117', desc:'GB Wall Boarding',               uom:'SQFT', sell:130, cost:85 },
+      { task:'GBWallfini',  costCode:'09-2200', desc:'GB Wall finishes',               uom:'SQFT', sell:130, cost:85 },
+      { task:'GBCeilinFr',  costCode:'09-2901', desc:'GB Ceiling Framing',             uom:'SQFT', sell:130, cost:85 },
+      { task:'GBCeiliBoa',  costCode:'09-2916', desc:'GB Ceiling Boarding',            uom:'SQFT', sell:130, cost:85 },
+      { task:'GBCeiliFin',  costCode:'09-2940', desc:'GB Ceiling Finishes',            uom:'SQFT', sell:130, cost:85 },
+      { task:'GBBHFramin',  costCode:'09-2902', desc:'GB Bulkhead Framing',            uom:'SQFT', sell:130, cost:85 },
+      { task:'GBBHBoardi',  costCode:'09-2917', desc:'GB Bulkhead Boarding',           uom:'SQFT', sell:130, cost:85 },
+      { task:'GBBHFinish',  costCode:'09-2941', desc:'GB Bulkhead Finishes',           uom:'SQFT', sell:130, cost:85 },
+      { task:'GBCovFram',   costCode:'09-2903', desc:'GB Coving Framing',              uom:'SQFT', sell:130, cost:85 },
+      { task:'GBCovBoard',  costCode:'09-2918', desc:'GB Coving Boarding',             uom:'SQFT', sell:130, cost:85 },
+      { task:'GBCovFinis',  costCode:'09-2942', desc:'GB Coving Finishes',             uom:'SQFT', sell:130, cost:85 },
+      { task:'Drwalpatch',  costCode:'09-2001', desc:'Drywall patching',               uom:'Each', sell:130, cost:85 },
+      { task:'WallBackin',  costCode:'06-1053', desc:'Wall Backing',                   uom:'SQFT', sell:130, cost:85 },
+      { task:'FireCaulki',  costCode:'07-8400', desc:'Fire Caulking',                  uom:'Each', sell:130, cost:85 },
+      { task:'CeilinGrid',  costCode:'09-5100', desc:'Ceiling tile System',            uom:'SQFT', sell:130, cost:85 },
+      { task:'FrameDoor',   costCode:'08-1000', desc:'Frames & Door slabs',            uom:'Each', sell:130, cost:85 },
+      { task:'Window',      costCode:'08-6000', desc:'Window frame & glass',           uom:'Each', sell:130, cost:85 },
+      { task:'Glazingwor',  costCode:'08-8100', desc:'Glazing work',                   uom:'Each', sell:130, cost:85 },
+      { task:'Furniture',   costCode:'12-5000', desc:'Furniture',                      uom:'Each', sell:130, cost:85 },
+      { task:'Millwork',    costCode:'06-2200', desc:'Millwork',                       uom:'Each', sell:130, cost:85 },
+      { task:'Floorprep',   costCode:'09-6010', desc:'Floor preparations',             uom:'Each', sell:130, cost:85 },
+      { task:'Floorfinis',  costCode:'09-6000', desc:'Flooring',                       uom:'Each', sell:130, cost:85 },
+      { task:'Baseboard',   costCode:'09-6020', desc:'Baseboard',                      uom:'Each', sell:130, cost:85 },
+      { task:'Wallfinish',  costCode:'09-0000', desc:'Wall finishes',                  uom:'Each', sell:130, cost:85 },
+      { task:'AcousticFi',  costCode:'09-8400', desc:'Acoustic Finishes',              uom:'Each', sell:130, cost:85 },
+      { task:'Epoxy',       costCode:'09-6500', desc:'Epoxy',                          uom:'Each', sell:130, cost:85 },
+      { task:'Epoxycovin',  costCode:'09-6510', desc:'Epoxy coving',                  uom:'Each', sell:130, cost:85 },
+      { task:'BlindsCurt',  costCode:'12-2100', desc:'Blinds / Curtains',             uom:'Each', sell:130, cost:85 },
+      { task:'Frosting',    costCode:'09-0010', desc:'Frosting',                       uom:'Each', sell:130, cost:85 },
+      { task:'Painting',    costCode:'09-9100', desc:'Painting',                       uom:'Each', sell:130, cost:85 },
+      { task:'Wallpaper',   costCode:'09-7200', desc:'Wall Coverings',                 uom:'Each', sell:130, cost:85 },
+      { task:'Ceramict',    costCode:'09-3000', desc:'Ceramic Tile',                   uom:'Each', sell:130, cost:85 },
+      { task:'Rentalequi',  costCode:'01-6030', desc:'Rental equipment',               uom:'Each', sell:130, cost:85 },
+      { task:'Washroacce',  costCode:'10-2813', desc:'Washroom accesories',            uom:'Each', sell:130, cost:85 },
+      { task:'Washrparti',  costCode:'10-2113', desc:'Washroom partitions',            uom:'Each', sell:130, cost:85 },
+      { task:'Structstee',  costCode:'05-1000', desc:'Structural steel',               uom:'Each', sell:130, cost:85 },
+      { task:'OHDoor',      costCode:'08-3600', desc:'Overhead door',                  uom:'Each', sell:130, cost:85 },
+      { task:'Lintel',      costCode:'05-1210', desc:'Lintel',                         uom:'Each', sell:130, cost:85 },
+      { task:'Blockwal',    costCode:'04-0000', desc:'Block wall',                     uom:'Each', sell:130, cost:85 },
+      { task:'Masonrepai',  costCode:'04-0120', desc:'Masonry repairs',                uom:'Each', sell:130, cost:85 },
+      { task:'Roofing',     costCode:'07-5000', desc:'Membrane Roofing & Sheet Metal', uom:'Each', sell:130, cost:85 },
+      { task:'Signeage',    costCode:'10-1400', desc:'Signeage',                       uom:'Each', sell:130, cost:85 },
+      { task:'Cstrenght',   costCode:'62-2441', desc:'Concrete strenght testing',      uom:'Each', sell:130, cost:85 },
+      { task:'contatest',   costCode:'62-2442', desc:'Soil contamination testing',     uom:'Each', sell:130, cost:85 },
+      { task:'Geotest',     costCode:'62-2443', desc:'Geotechnical test',              uom:'Each', sell:130, cost:85 },
+      { task:'compactest',  costCode:'62-2444', desc:'Soil compaction test',           uom:'Each', sell:130, cost:85 },
+      { task:'Tempfence',   costCode:'01-3250', desc:'Temporary fence',               uom:'Each', sell:130, cost:85 },
+      { task:'Concretcut',  costCode:'03-8000', desc:'Concrete cutting',               uom:'Each', sell:130, cost:85 },
+      { task:'Disposal',    costCode:'01-3410', desc:'Concrete/soil disposal',         uom:'Each', sell:130, cost:85 },
+      { task:'Excavation',  costCode:'31-2000', desc:'Excavation',                     uom:'Each', sell:130, cost:85 },
+      { task:'Granular',    costCode:'31-2010', desc:'Granular installation',          uom:'Each', sell:130, cost:85 },
+      { task:'Rebar',       costCode:'03-1020', desc:'Rebar',                          uom:'Each', sell:130, cost:85 },
+      { task:'Steelmesh',   costCode:'03-2001', desc:'Steel mesh',                     uom:'Each', sell:130, cost:85 },
+      { task:'Concsupply',  costCode:'03-3100', desc:'Concrete supply',                uom:'M3',   sell:130, cost:85 },
+      { task:'Concpouri',   costCode:'03-3010', desc:'Concrete pouring',               uom:'Each', sell:130, cost:85 },
+      { task:'Concfinish',  costCode:'03-3500', desc:'Concrete finish',                uom:'Each', sell:130, cost:85 },
+      { task:'Embededite',  costCode:'03-3550', desc:'Embeded items',                  uom:'Each', sell:130, cost:85 },
+      { task:'Waterproof',  costCode:'07-1000', desc:'Waterproofing',                  uom:'Each', sell:130, cost:85 },
+      { task:'Cleaning',    costCode:'01-7400', desc:'Cleaning',                       uom:'Each', sell:130, cost:85 },
+      { task:'Expanjoint',  costCode:'03-8010', desc:'Expansion joints',               uom:'Each', sell:130, cost:85 },
+      { task:'Grouting',    costCode:'03-6010', desc:'Grouting',                       uom:'Each', sell:130, cost:85 },
+      { task:'EngShopDw',   costCode:'00-2000', desc:'Engineering/Shop Dwgs',          uom:'Each', sell:130, cost:85 },
+      { task:'Miscelan',    costCode:'01-9999', desc:'Miscelaneous',                   uom:'Each', sell:130, cost:85 },
+      { task:'Asphalt',     costCode:'32-1200', desc:'Asphalt',                        uom:'Each', sell:130, cost:85 },
+      { task:'Linepaint',   costCode:'09-9110', desc:'Line painting',                  uom:'Each', sell:130, cost:85 },
+      { task:'CurbGutter',  costCode:'32-1600', desc:'Curbs, gutters and sidewalks',   uom:'Each', sell:130, cost:85 },
+      { task:'FenceGate',   costCode:'32-3113', desc:'Fence and gates',                uom:'Each', sell:130, cost:85 },
+      { task:'Siding',      costCode:'07-4600', desc:'Siding',                         uom:'Each', sell:130, cost:85 },
+      { task:'MortarGrou',  costCode:'04-0305', desc:'Mortar & Grout',                 uom:'Each', sell:130, cost:85 },
+      { task:'Stonemanso',  costCode:'04-0343', desc:'Stone mansory',                  uom:'Each', sell:130, cost:85 },
+      { task:'Brickwall',   costCode:'04-2113', desc:'Brick wall',                     uom:'Each', sell:130, cost:85 },
+      { task:'MiscSteel',   costCode:'05-1010', desc:'Misc Steel',                     uom:'Each', sell:130, cost:85 },
+      { task:'Grading',     costCode:'31-2213', desc:'Grading',                        uom:'Each', sell:130, cost:85 },
+      { task:'Concform',    costCode:'03-3000', desc:'Forming',                        uom:'Each', sell:130, cost:85 },
+      { task:'DrywallWal',  costCode:'09-2116', desc:'Drywall Walls',                  uom:'Each', sell:130, cost:85 }
+    ]
+  },
+  {
+    key: 'concrete-exterior',
+    name: 'Concrete and exterior work template',
+    items: [
+      { task:'ProjectMan',  costCode:'01-1010', desc:'ProjectManager',                 uom:'Each', sell:140, cost:93 },
+      { task:'Sitesuperv',  costCode:'01-1010', desc:'Site supervision',               uom:'Each', sell:140, cost:93 },
+      { task:'GCSitesupe',  costCode:'01-1020', desc:'GC Site supervision',            uom:'Each', sell:140, cost:93 },
+      { task:'Coordinato',  costCode:'01-1050', desc:'Coordinator',                    uom:'Each', sell:130, cost:85 },
+      { task:'CloseAsBui',  costCode:'64-1060', desc:'Close-out/AsBuilts',             uom:'Each', sell:130, cost:85 },
+      { task:'Trailers',    costCode:'01-3210', desc:'Trailers',                       uom:'Each', sell:130, cost:85 },
+      { task:'Portablewa',  costCode:'01-3230', desc:'Portable washroom',              uom:'Each', sell:130, cost:85 },
+      { task:'Cstrenght',   costCode:'62-2440', desc:'Concrete strenght testing',      uom:'Each', sell:130, cost:85 },
+      { task:'contatest',   costCode:'62-2440', desc:'Soil contamination testing',     uom:'Each', sell:130, cost:85 },
+      { task:'Geotest',     costCode:'62-2440', desc:'Geotechnical test',              uom:'Each', sell:130, cost:85 },
+      { task:'compactest',  costCode:'62-2440', desc:'Soil compaction test',           uom:'Each', sell:130, cost:85 },
+      { task:'Tempfence',   costCode:'01-3250', desc:'Temporary fence',                uom:'Each', sell:130, cost:85 },
+      { task:'Concretcut',  costCode:'03-8000', desc:'Concrete cutting',               uom:'Each', sell:130, cost:85 },
+      { task:'Disposal',    costCode:'01-3410', desc:'Concrete/soil disposal',         uom:'Each', sell:130, cost:85 },
+      { task:'Excavation',  costCode:'31-2000', desc:'Excavation',                     uom:'Each', sell:130, cost:85 },
+      { task:'Granular',    costCode:'31-2010', desc:'Granular installation',          uom:'Each', sell:130, cost:85 },
+      { task:'Rebar',       costCode:'03-1020', desc:'Rebar',                          uom:'Each', sell:130, cost:85 },
+      { task:'Steelmesh',   costCode:'03-2001', desc:'Steel mesh',                     uom:'Each', sell:130, cost:85 },
+      { task:'Concsupply',  costCode:'03-3100', desc:'Concrete supply',                uom:'M3',   sell:130, cost:85 },
+      { task:'Concpouri',   costCode:'03-3010', desc:'Concrete pouring',               uom:'Each', sell:130, cost:85 },
+      { task:'Concfinish',  costCode:'03-3500', desc:'Concrete finish',                uom:'Each', sell:130, cost:85 },
+      { task:'Embededite',  costCode:'03-3550', desc:'Embeded items',                  uom:'Each', sell:130, cost:85 },
+      { task:'Waterproof',  costCode:'07-1000', desc:'Waterproofing',                  uom:'Each', sell:130, cost:85 },
+      { task:'Cleaning',    costCode:'01-7400', desc:'Cleaning',                       uom:'Each', sell:130, cost:85 },
+      { task:'Expanjoint',  costCode:'03-8010', desc:'Expansion joints',               uom:'Each', sell:130, cost:85 },
+      { task:'Grouting',    costCode:'03-6010', desc:'Grouting',                       uom:'Each', sell:130, cost:85 },
+      { task:'EngShopDw',   costCode:'00-200',  desc:'Engineering/Shop Dwgs',          uom:'Each', sell:130, cost:85 },
+      { task:'Miscelan',    costCode:'01-9999', desc:'Miscelaneous',                   uom:'Each', sell:130, cost:85 },
+      { task:'Asphalt',     costCode:'32-1200', desc:'Asphalt',                        uom:'Each', sell:130, cost:85 },
+      { task:'Linepaint',   costCode:'09-9110', desc:'Line painting',                  uom:'Each', sell:130, cost:85 },
+      { task:'CurbGutter',  costCode:'32-1600', desc:'Curbs, gutters and sidewalks',   uom:'Each', sell:130, cost:85 },
+      { task:'FenceGate',   costCode:'32-3113', desc:'Fence and gates',                uom:'Each', sell:130, cost:85 },
+      { task:'Concform',    costCode:'03-3000', desc:'Forming',                        uom:'Each', sell:130, cost:85 }
+    ]
+  },
+  {
+    key: 'office-washroom-template',
+    name: 'Office & Washroom template',
+    items: [
+      { task:'ProjectMan',  costCode:'01-1010', desc:'ProjectManager',                 uom:'Each', sell:140, cost:93 },
+      { task:'Sitesuperv',  costCode:'01-1010', desc:'Site supervision',               uom:'Each', sell:140, cost:93 },
+      { task:'GCSitesupe',  costCode:'01-1020', desc:'GC Site supervision',            uom:'Each', sell:140, cost:93 },
+      { task:'Coordinato',  costCode:'01-1050', desc:'Coordinator',                    uom:'Each', sell:130, cost:85 },
+      { task:'CloseAsBui',  costCode:'64-1060', desc:'Close-out/AsBuilts',             uom:'Each', sell:130, cost:85 },
+      { task:'Trailers',    costCode:'01-3210', desc:'Trailers',                       uom:'Each', sell:130, cost:85 },
+      { task:'Portablewa',  costCode:'01-3230', desc:'Portable washroom',              uom:'Each', sell:130, cost:85 },
+      { task:'Tarping',     costCode:'01-5600', desc:'Tarping',                        uom:'Each', sell:130, cost:85 },
+      { task:'Hoarding',    costCode:'01-5600', desc:'Hoarding',                       uom:'Each', sell:130, cost:85 },
+      { task:'Siteprep',    costCode:'02-4000', desc:'Site preparations',              uom:'Each', sell:130, cost:85 },
+      { task:'Floorprote',  costCode:'02-4010', desc:'Floor protection',               uom:'Each', sell:130, cost:85 },
+      { task:'Demolition',  costCode:'02-4100', desc:'Demolition',                     uom:'Each', sell:130, cost:85 },
+      { task:'Concscann',   costCode:'02-4116', desc:'Concrete scanning',              uom:'Each', sell:130, cost:85 },
+      { task:'Trenching',   costCode:'31-2333', desc:'Trenching',                      uom:'Each', sell:130, cost:85 },
+      { task:'GBWallFram',  costCode:'09-2240', desc:'GB Wall Framing',                uom:'SQFT', sell:130, cost:85 },
+      { task:'GBWallBoar',  costCode:'09-2117', desc:'GB Wall Boarding',               uom:'SQFT', sell:130, cost:85 },
+      { task:'GBWallfini',  costCode:'09-2200', desc:'GB Wall finishes',               uom:'SQFT', sell:130, cost:85 },
+      { task:'GBCeilinFr',  costCode:'09-2900', desc:'GB Ceiling Framing',             uom:'SQFT', sell:130, cost:85 },
+      { task:'GBCeiliBoa',  costCode:'09-2916', desc:'GB Ceiling Boarding',            uom:'SQFT', sell:130, cost:85 },
+      { task:'GBCeiliFin',  costCode:'09-2940', desc:'GB Ceiling Finishes',            uom:'SQFT', sell:130, cost:85 },
+      { task:'GBBHFramin',  costCode:'09-2900', desc:'GB Bulkhead Framing',            uom:'SQFT', sell:130, cost:85 },
+      { task:'GBBHBoardi',  costCode:'09-2917', desc:'GB Bulkhead Boarding',           uom:'SQFT', sell:130, cost:85 },
+      { task:'GBBHFinish',  costCode:'09-2941', desc:'GB Bulkhead Finishes',           uom:'SQFT', sell:130, cost:85 },
+      { task:'GBCovFram',   costCode:'09-2900', desc:'GB Coving Framing',              uom:'SQFT', sell:130, cost:85 },
+      { task:'GBCovBoard',  costCode:'09-2918', desc:'GB Coving Boarding',             uom:'SQFT', sell:130, cost:85 },
+      { task:'GBCovFinis',  costCode:'09-2942', desc:'GB Coving Finishes',             uom:'SQFT', sell:130, cost:85 },
+      { task:'Drwalpatch',  costCode:'09-2001', desc:'Drywall patching',               uom:'Each', sell:130, cost:85 },
+      { task:'WallBackin',  costCode:'06-1053', desc:'Wall Backing',                   uom:'SQFT', sell:130, cost:85 },
+      { task:'FireCaulki',  costCode:'07-8400', desc:'Fire Caulking',                  uom:'Each', sell:130, cost:85 },
+      { task:'CeilinGrid',  costCode:'09-5100', desc:'Ceiling tile System',            uom:'SQFT', sell:130, cost:85 },
+      { task:'FrameDoor',   costCode:'08-1000', desc:'Frames & Door slabs',            uom:'Each', sell:130, cost:85 },
+      { task:'Window',      costCode:'08-6000', desc:'Window frame & glass',           uom:'Each', sell:130, cost:85 },
+      { task:'Glazingwor',  costCode:'08-8100', desc:'Glazing work',                   uom:'Each', sell:130, cost:85 },
+      { task:'Furniture',   costCode:'12-5000', desc:'Furniture',                      uom:'Each', sell:130, cost:85 },
+      { task:'Millwork',    costCode:'06-2200', desc:'Millwork',                       uom:'Each', sell:130, cost:85 },
+      { task:'Floorprep',   costCode:'09-6010', desc:'Floor preparations',             uom:'Each', sell:130, cost:85 },
+      { task:'Floorfinis',  costCode:'09-6000', desc:'Flooring',                       uom:'Each', sell:130, cost:85 },
+      { task:'Baseboard',   costCode:'09-6020', desc:'Baseboard',                      uom:'Each', sell:130, cost:85 },
+      { task:'Wallfinish',  costCode:'09-0000', desc:'Wall finishes',                  uom:'Each', sell:130, cost:85 },
+      { task:'AcousticFi',  costCode:'09-8400', desc:'Acoustic Finishes',              uom:'Each', sell:130, cost:85 },
+      { task:'Epoxy',       costCode:'09-6500', desc:'Epoxy',                          uom:'Each', sell:130, cost:85 },
+      { task:'Epoxycovin',  costCode:'09-6510', desc:'Epoxy coving',                  uom:'Each', sell:130, cost:85 },
+      { task:'BlindsCurt',  costCode:'12-2100', desc:'Blinds / Curtains',             uom:'Each', sell:130, cost:85 },
+      { task:'Frosting',    costCode:'09-0010', desc:'Frosting',                       uom:'Each', sell:130, cost:85 },
+      { task:'Painting',    costCode:'09-9100', desc:'Painting',                       uom:'Each', sell:130, cost:85 },
+      { task:'Wallpaper',   costCode:'09-9110', desc:'Wall Coverings',                 uom:'Each', sell:130, cost:85 },
+      { task:'CeramicT',    costCode:'09-3000', desc:'Ceramic Tile',                   uom:'Each', sell:130, cost:85 },
+      { task:'Cleaning',    costCode:'01-7400', desc:'Cleaning',                       uom:'Each', sell:130, cost:85 },
+      { task:'Rentalequi',  costCode:'01-6030', desc:'Rental equipment',               uom:'Each', sell:130, cost:85 },
+      { task:'Miscelan',    costCode:'01-9999', desc:'Miscelaneous',                   uom:'Each', sell:130, cost:85 },
+      { task:'Washroacce',  costCode:'10-2813', desc:'Washroom accesories',            uom:'Each', sell:130, cost:85 },
+      { task:'Washrparti',  costCode:'10-2113', desc:'Washroom partitions',            uom:'Each', sell:130, cost:85 },
+      { task:'Structstee',  costCode:'05-1000', desc:'Structural steel',               uom:'Each', sell:130, cost:85 },
+      { task:'OHDoor',      costCode:'08-3600', desc:'Over head door',                 uom:'Each', sell:130, cost:85 },
+      { task:'Lintel',      costCode:'05-1210', desc:'Lintel',                         uom:'Each', sell:130, cost:85 },
+      { task:'Blockwal',    costCode:'04-0000', desc:'Block wall',                     uom:'Each', sell:130, cost:85 },
+      { task:'Masonrepai',  costCode:'04-0120', desc:'Masonry repairs',                uom:'Each', sell:130, cost:85 },
+      { task:'Roofing',     costCode:'07-5000', desc:'Membrane Roofing & Sheet Metal', uom:'Each', sell:130, cost:85 },
+      { task:'Signeage',    costCode:'10-1400', desc:'Signeage',                       uom:'Each', sell:130, cost:85 },
+      { task:'DrywallWal',  costCode:'09-2116', desc:'Drywall Walls',                  uom:'Each', sell:130, cost:85 }
+    ]
+  }
+];
+
+function seedConstructionTemplates(){
+  applyConstructionTemplateToSheet(CONSTRUCTION_TEMPLATES.length ? CONSTRUCTION_TEMPLATES[0] : null);
+}
+
+function applyConstructionTemplateToSheet(template){
+  const sh = SpreadsheetApp.getActive().getSheetByName(S_TPL_C);
+  if (!sh) return;
+
+  sh.clear({contentsOnly:true});
+  sh.getRange(1,1,1,CONSTRUCTION_TEMPLATE_HEADER.length)
+    .setValues([CONSTRUCTION_TEMPLATE_HEADER])
+    .setFontWeight('bold');
+
+  if (!template || !template.items || !template.items.length) return;
+
+  const rows = template.items.map(item => [
+    item.task || '',
+    item.costCode || '',
+    CONSTRUCTION_TEMPLATE_DEFAULTS.accountGroup,
+    item.desc || '',
+    String(item.uom || '').toUpperCase(),
+    Number(item.sell) || 0,
+    Number(item.cost) || 0,
+    CONSTRUCTION_TEMPLATE_DEFAULTS.type,
+    CONSTRUCTION_TEMPLATE_DEFAULTS.tax,
+    '',
+    ''
+  ]);
+
+  sh.getRange(2,1,rows.length,rows[0].length).setValues(rows);
+}
+
+function findConstructionTemplateByName(name){
+  if (!name) return null;
+  const needle = String(name).trim().toLowerCase();
+  return CONSTRUCTION_TEMPLATES.find(t => t.name.toLowerCase() === needle || t.key.toLowerCase() === needle) || null;
+}
+
+function collectTemplateEntriesForDivision_(div){
+  if (!div) return [];
+
+  if (div.key === 'CON'){
+    const out = [];
+    CONSTRUCTION_TEMPLATES.forEach(tpl=>{
+      (tpl.items || []).forEach(item=>{
+        out.push({
+          task: String(item.task || '').trim(),
+          costCode: String(item.costCode || '').trim(),
+          acct: String(item.accountGroup || CONSTRUCTION_TEMPLATE_DEFAULTS.accountGroup || '').trim().toUpperCase(),
+          desc: String(item.desc || '').trim(),
+          uom: String(item.uom || 'HOUR').trim().toUpperCase(),
+          sellRate: Number(item.sell) || 0,
+          costRate: Number(item.cost) || 0,
+          type: CONSTRUCTION_TEMPLATE_DEFAULTS.type,
+          tax: CONSTRUCTION_TEMPLATE_DEFAULTS.tax,
+          start: '',
+          end: '',
+          template: tpl.name
+        });
+      });
+    });
+    return out;
+  }
+
+  const tplName = getTemplateSheetForDivision_(div);
+  if (!tplName) return [];
+  const tpl = SpreadsheetApp.getActive().getSheetByName(tplName);
+  if (!tpl) return [];
+  const last = tpl.getLastRow();
+  if (last < 2) return [];
+
+  const vals = tpl.getRange(2,1,last-1,11).getValues();
+  return vals.map(r=>({
+    task: String(r[0]||'').trim(),
+    costCode: String(r[1]||'').trim(),
+    acct: String(r[2]||'').trim().toUpperCase(),
+    desc: String(r[3]||'').trim(),
+    uom: String(r[4]||'').trim().toUpperCase(),
+    sellRate: Number(r[5])||0,
+    costRate: Number(r[6])||0,
+    type: String(r[7]||'').trim(),
+    tax: String(r[8]||'').trim(),
+    start: r[9] || '',
+    end: r[10]|| '',
+    template: tplName
+  }));
+}
+
+function uniqueDescriptionsForDivision_(div){
+  const entries = collectTemplateEntriesForDivision_(div);
+  if (div && div.key === 'MEC'){
+    entries.sort((a, b)=>{
+      const codeA = String(a.costCode || '').trim();
+      const codeB = String(b.costCode || '').trim();
+      if (codeA === codeB){
+        const descA = String(a.desc || '').trim();
+        const descB = String(b.desc || '').trim();
+        return descA.localeCompare(descB, undefined, { sensitivity: 'base' });
+      }
+      return codeB.localeCompare(codeA, undefined, { numeric: true, sensitivity: 'base' });
+    });
+  }
+  const seen = new Set();
+  const unique = [];
+  entries.forEach(e=>{
+    const desc = String(e.desc || '').trim();
+    if (!desc) return;
+    const key = desc.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    unique.push(desc);
+  });
+  return { entries, descriptions: unique };
+}
+
+function sortRowsByCostCode_(rows){
+  const copy = rows.slice();
+  copy.sort((a, b)=>{
+    const codeA = String(a[1]||'').trim();
+    const codeB = String(b[1]||'').trim();
+    if (codeA === codeB){
+      const descA = String(a[3]||'').trim();
+      const descB = String(b[3]||'').trim();
+      return descA.localeCompare(descB, undefined, { sensitivity: 'base' });
+    }
+    return codeB.localeCompare(codeA, undefined, { numeric: true, sensitivity: 'base' });
+  });
+  return copy;
 }
 
 /** Template Electrical from your tables (sell + cost) */
@@ -1673,14 +2045,16 @@ function seedElectricalTemplate(){
     ['ERENTALS','01-6030','Equipment Rental',130],
     ['ESAINSP','26-0000','ESA Inspection',130],
     ['ESDTIN','26-2402','Shutdown/ Tie In',130],
-    ['ESUPERVISI','26-0000','Electrical Supervision',140]
+    ['ESUPERVISI','26-0000','Electrical Supervision',140],
+    ['ELECTRICPM','26-0000','Electrical Project Manager',140]
   ];
 
   // cost table (task -> cost rate)
   const costMap = {
     'EGCSUPERVI':93, 'ESUPERVISI':93,
     'ECIRCUITRI':85,'EDATACOMF':85,'EDATACOMRI':85,'EDEMOLITIO':85,'EDISTRIBU':85,
-    'EFIREALARM':85,'ELIGHTINGF':85,'ELIGHTINRI':85,'ESDTIN':85
+    'EFIREALARM':85,'ELIGHTINGF':85,'ELIGHTINRI':85,'ESDTIN':85,
+    'ELECTRICPM':85
   };
 
   const rows = sellRows.map(([task, code, desc, sell])=>[
@@ -1852,26 +2226,22 @@ function UI_Add_FreeText_NE_Here(){
 /** Template indexes */
 function readTplIndex_AllDivs(){
   const out = {};
-  [S_TPL_P, S_TPL_E, S_TPL_C, S_TPL_H].forEach(name=>{
-    const tpl = SpreadsheetApp.getActive().getSheetByName(name);
-    if (!tpl) return;
-    const last = tpl.getLastRow();
-    if (last < 2) return;
-    const vals = tpl.getRange(2,1,last-1,11).getValues(); // A..K
-    vals.forEach(r=>{
-      const task = String(r[0]||'').trim(); if (!task) return;
+  DIVS.forEach(div=>{
+    collectTemplateEntriesForDivision_(div).forEach(meta=>{
+      const task = String(meta.task || '').trim();
+      if (!task) return;
       out[task] = {
         task,
-        costCode: String(r[1]||'').trim(),
-        acct:     String(r[2]||'').trim(),
-        desc:     String(r[3]||'').trim(),
-        uom:      String(r[4]||'').trim(),
-        sellRate: Number(r[5])||0,
-        costRate: Number(r[6])||0,
-        type:     String(r[7]||'').trim(),
-        tax:      String(r[8]||'').trim(),
-        start:    r[9] || '',
-        end:      r[10]|| ''
+        costCode: String(meta.costCode || '').trim(),
+        acct:     String(meta.acct || '').trim(),
+        desc:     String(meta.desc || '').trim(),
+        uom:      String(meta.uom || '').trim(),
+        sellRate: Number(meta.sellRate) || 0,
+        costRate: Number(meta.costRate) || 0,
+        type:     String(meta.type || '').trim(),
+        tax:      String(meta.tax || '').trim(),
+        start:    meta.start || '',
+        end:      meta.end || ''
       };
     });
   });
@@ -1879,28 +2249,22 @@ function readTplIndex_AllDivs(){
 }
 
 function readTplIndexByDesc_(div){ // by Description for the division template
-  const tplName = getTemplateSheetForDivision_(div);
-  const tpl = SpreadsheetApp.getActive().getSheetByName(tplName);
-  if (!tpl) return {};
-  const last = tpl.getLastRow();
   const idx = {};
-  if (last >= 2){
-    const vals = tpl.getRange(2,1,last-1,11).getValues();
-    vals.forEach(r=>{
-      const task = String(r[0]||'').trim();
-      const desc = String(r[3]||'').trim();
-      if (!desc) return;
+  collectTemplateEntriesForDivision_(div).forEach(meta=>{
+    const desc = String(meta.desc || '').trim();
+    if (!desc) return;
+    if (!idx[desc]){
       idx[desc] = {
-        task,
-        costCode: String(r[1]||'').trim(),
-        acct:     String(r[2]||'').trim(),
+        task:     String(meta.task || '').trim(),
+        costCode: String(meta.costCode || '').trim(),
+        acct:     String(meta.acct || '').trim(),
         desc,
-        uom:      String(r[4]||'').trim(),
-        sellRate: Number(r[5])||0,
-        costRate: Number(r[6])||0
+        uom:      String(meta.uom || '').trim(),
+        sellRate: Number(meta.sellRate) || 0,
+        costRate: Number(meta.costRate) || 0
       };
-    });
-  }
+    }
+  });
   return idx;
 }
 
@@ -1941,22 +2305,25 @@ function buildProjectTasksCSV_(){
     if (selling <= 0) return;                           // hard guard
     const task = String(u.sh.getRange(u.row, COL.TASK).getValue()||'').trim();
     if (!task) return;
-    tasks.set(task, true);
+    if (!tasks.has(task)) {
+      const fallbackDesc = String(u.sh.getRange(u.row, COL.DESC).getDisplayValue() || u.sh.getRange(u.row, COL.DESC).getValue() || '').trim();
+      tasks.set(task, { fallbackDesc });
+    }
   });
 
   // Proper header casing
   const header = ['Project Task','Description','Type','Planned Start Date','Planned End Date','Tax Category'];
   const rows = [header];
 
-  tasks.forEach((_, task)=>{
+  tasks.forEach((info, task)=>{
     const meta = idx[task] || {};
     rows.push([
       task,
-      meta.desc || '',
-      meta.type || '',
+      meta.desc || (info && info.fallbackDesc) || '',
+      'Cost and Revenue Task',
       todayStr,
       todayStr,
-      meta.tax || ''
+      'H'
     ]);
   });
 
@@ -1965,13 +2332,6 @@ function buildProjectTasksCSV_(){
   return { name, csv };
 }
 
-
-function asTextCode_(code){
-  const s = String(code||'').trim();
-  if (!s) return '';
-  // Force spreadsheet apps to keep it as text (not date) on import
-  return `="${s}"`;
-}
 
 function roundTo_(value, decimals){
   const num = Number(value);
@@ -1987,8 +2347,22 @@ function buildEstimationCSV_(){
 
   const lines = [];
   // Title-cased headers per your requirement
-  const header = ['Project Task','Cost Code','Cost Account Group','Description','UOM','Quantity','Unit Cost','Unit Price'];
+  const header = ['Project Task','Cost Code','Cost Account Group','Description','UOM','Quantity','Unit Cost','Unit Price','Tax Category'];
   lines.push(header);
+
+  const pushLine = ({ task, code, group, description, uom, quantity, unitCost, unitPrice }) => {
+    lines.push([
+      task,
+      code,
+      group,
+      description,
+      uom,
+      quantity,
+      unitCost,
+      unitPrice,
+      'H'
+    ]);
+  };
 
   DIVS.forEach(div=>{
     const sh = SpreadsheetApp.getActive().getSheetByName(div.sheet);
@@ -2012,14 +2386,21 @@ function buildEstimationCSV_(){
 
       const task = String(r[COL.TASK-1]||'').trim(); if (!task) continue;
       const codeRaw = String(r[COL.COST_CODE-1]||'').trim();
-      const code = asTextCode_(codeRaw || (idx[task]?.costCode || ''));  // keep as text
+      const code = codeRaw || (idx[task]?.costCode || '');
       const lineCostRate = Number(r[COL.COST_RATE_HR-1]) || (idx[task]?.costRate || costHrDefault);
 
       // LABOUR
       if (lhrs > 0){
-        lines.push([
-          task, code, 'L', desc, 'HOURS', lhrs, lineCostRate, rateSell
-        ]);
+        pushLine({
+          task,
+          code,
+          group: 'L',
+          description: desc,
+          uom: 'HOUR',
+          quantity: lhrs,
+          unitCost: lineCostRate,
+          unitPrice: rateSell
+        });
       }
       // MATERIAL quoted (MQ)
       if (mat > 0){
@@ -2027,23 +2408,45 @@ function buildEstimationCSV_(){
         if (task === 'CCEILTILE' && area > 0){
           const qty = roundTo_(area, 2);
           const unitCost = roundTo_(mat / area, 2);
-          const unitPrice = roundTo_(mat / area, 2);
-          lines.push([
-            task, code, 'MQ', desc + ' - Material', 'SQFT', qty, unitCost, unitPrice
-          ]);
+          const totalSellMat = sellM || (mat * (1 + mk));
+          const unitPrice = roundTo_(totalSellMat / area, 2);
+          pushLine({
+            task,
+            code,
+            group: 'MQ',
+            description: desc + ' - Material',
+            uom: 'SQFT',
+            quantity: qty,
+            unitCost,
+            unitPrice
+          });
         } else {
           const sellMat = sellM || (mat * (1 + mk));
-          lines.push([
-            task, code, 'MQ', desc + ' - Material', 'EACH', 1, mat, sellMat
-          ]);
+          pushLine({
+            task,
+            code,
+            group: 'MQ',
+            description: desc + ' - Material',
+            uom: 'EACH',
+            quantity: 1,
+            unitCost: mat,
+            unitPrice: sellMat
+          });
         }
       }
       // SUBTRADE (S)
       if (subs > 0){
         const sellSub = sellS || (subs * (1 + mk));
-        lines.push([
-          task, code, 'S', desc + ' - Subcontractor', 'EACH', 1, subs, sellSub
-        ]);
+        pushLine({
+          task,
+          code,
+          group: 'S',
+          description: desc + ' - Subcontractor',
+          uom: 'EACH',
+          quantity: 1,
+          unitCost: subs,
+          unitPrice: sellSub
+        });
       }
     }
   });
